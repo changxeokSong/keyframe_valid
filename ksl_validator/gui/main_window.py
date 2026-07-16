@@ -1051,7 +1051,8 @@ class MainWindow(QMainWindow):
         self._current_video_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = self._current_video_cap.read()
         if ret:
-            self.site_frame_label.setPixmap(cv2_to_pixmap(frame))
+            # 포즈 표시 체크박스 켰을 때만 오버레이 비용이 붙는다 - 기본(꺼짐)은 그대로 빠름
+            self._display_frame(self.site_frame_label, frame)
         self.frame_idx_label.setText(f"프레임: {idx} / {self._current_video_total - 1}")
 
     def _toggle_play(self):
