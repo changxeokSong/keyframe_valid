@@ -9,6 +9,7 @@ sldict 사이트의 '수형 사진'은 일러스트(선화)라 MediaPipe/YOLO가
 
 from __future__ import annotations
 
+import shutil
 import time
 from pathlib import Path
 from typing import Optional
@@ -17,8 +18,56 @@ import cv2
 import numpy as np
 
 from .logging_setup import log
+from .paths import NAS_VIDEO_CACHE_DIR
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
+NAS_VIDEO_CACHE_MAX_FILES = 15  # 무제한으로 쌓이면 부담되므로 최근 것만 유지 (LRU)
+
+
+def _get_local_video_copy(nas_path: Path) -> Path:
+    """NAS 동영상을 로컬(cache/nas_videos/)에 통째로 한 번 복사해두고 그 경로를 반환.
+
+    압축 동영상은 임의 프레임으로 바로 못 가고 가까운 키프레임부터 디코딩해야 해서,
+    seek 한 번에도 파일 여러 지점을 오가며 읽는다. 로컬 디스크에선 거의 공짜지만
+    네트워크 공유 폴더(NAS)에서는 그 하나하나가 왕복 지연이라 느리다(직접 확인:
+    항목당 몇 초). 수어 영상은 보통 짧아서(수 MB) 파일 전체를 한 번에 순차로
+    복사하는 게, 여러 번 흩어져서 seek하는 것보다 오히려 더 빠르다.
+
+    디스크가 무한정 쌓이지 않도록 최근 사용한 NAS_VIDEO_CACHE_MAX_FILES개만 유지하고
+    오래된 것부터 지운다(LRU).
+    """
+    NAS_VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    local_path = NAS_VIDEO_CACHE_DIR / nas_path.name
+
+    nas_size = nas_path.stat().st_size
+    if local_path.exists() and local_path.stat().st_size == nas_size:
+        local_path.touch()  # LRU 최신화
+        return local_path
+
+    t0 = time.perf_counter()
+    tmp_path = local_path.with_suffix(local_path.suffix + ".part")
+    shutil.copyfile(nas_path, tmp_path)
+    tmp_path.rename(local_path)
+    log.info(
+        f"[keyframe_images] NAS 영상 로컬 캐시 복사: {nas_path.name} "
+        f"({nas_size / 1024:.0f}KB), {time.perf_counter() - t0:.3f}초"
+    )
+
+    _evict_old_cached_videos()
+    return local_path
+
+
+def _evict_old_cached_videos() -> None:
+    files = sorted(
+        (p for p in NAS_VIDEO_CACHE_DIR.glob("*") if p.is_file() and not p.name.endswith(".part")),
+        key=lambda p: p.stat().st_mtime,
+    )
+    excess = len(files) - NAS_VIDEO_CACHE_MAX_FILES
+    for p in files[:max(0, excess)]:
+        try:
+            p.unlink()
+        except OSError:
+            pass
 
 
 def find_keyframe_images(keyframe_images_dir: Path, origin_no: str) -> list[Path]:
@@ -68,11 +117,12 @@ def load_gloss_reference_images(entry, keyframe_images_dir: Optional[Path] = Non
 
 def resolve_instance_video_path(entry, dataset_root: Optional[Path]) -> Optional[Path]:
     """entry가 가리키는 그 특정 인스턴스의 실제 영상 파일 경로 (재생용).
+    NAS 원본이 있으면 로컬 캐시로 복사해서 그 경로를 준다(재생/스크럽이 빠르게).
     gloss_reference_images(글로스 공통 사진)에는 대응하는 영상이 없으므로 None."""
     if dataset_root is not None and getattr(entry, "video_rel_path", None):
         p = Path(dataset_root) / entry.video_rel_path
         if p.exists():
-            return p
+            return _get_local_video_copy(p)
     return None
 
 
@@ -94,8 +144,11 @@ def load_instance_keyframes(entry, dataset_root: Optional[Path] = None,
             return [frame]
 
     if dataset_root is not None and getattr(entry, "video_rel_path", None) and entry.keyframes:
-        video_path = Path(dataset_root) / entry.video_rel_path
-        if video_path.exists():
+        nas_video_path = Path(dataset_root) / entry.video_rel_path
+        if nas_video_path.exists():
+            # 먼저 로컬로 통째 복사(또는 이미 캐시돼 있으면 재사용)한 뒤, 그 로컬 파일에서
+            # seek한다 - NAS에서 직접 여러 번 seek하는 것보다 빠르다(위 함수 설명 참고).
+            video_path = _get_local_video_copy(nas_video_path)
             t0 = time.perf_counter()
             cap = cv2.VideoCapture(str(video_path))
             frames = []
@@ -106,7 +159,7 @@ def load_instance_keyframes(entry, dataset_root: Optional[Path] = None,
                     frames.append(frame)
             cap.release()
             log.debug(
-                f"[keyframe_images] NAS 원본 비디오(인스턴스 전용) 프레임 읽기 {video_path.name}: "
+                f"[keyframe_images] 로컬 캐시 비디오(인스턴스 전용) 프레임 읽기 {video_path.name}: "
                 f"{time.perf_counter() - t0:.3f}초, {len(frames)}장"
             )
             if frames:

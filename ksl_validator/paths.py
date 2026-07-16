@@ -21,6 +21,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = PROJECT_ROOT / "cache"
 VIDEOS_CACHE_DIR = CACHE_DIR / "videos"
 HANDSHAPE_CACHE_DIR = CACHE_DIR / "handshape_images"
+# NAS 원본 영상을 seek/재생하기 전에 로컬로 통째로 복사해두는 캐시.
+# 네트워크 공유 폴더에서 프레임 단위로 seek하면 매번 네트워크 왕복이 생겨 느리므로
+# (압축 동영상은 가까운 키프레임부터 디코딩해야 해서 여러 번 왔다갔다 함),
+# 파일 하나를 한 번에 순차 복사해두고 그 뒤로는 로컬 디스크처럼 빠르게 쓴다.
+NAS_VIDEO_CACHE_DIR = CACHE_DIR / "nas_videos"
 
 # 검증 결과/리뷰 기록
 REPORTS_DIR = PROJECT_ROOT / "reports"
