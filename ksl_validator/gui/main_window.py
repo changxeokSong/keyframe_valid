@@ -102,20 +102,29 @@ class MainWindow(QMainWindow):
         self.worker: Optional[ValidationWorker] = None
         self._current_video_cap: Optional[cv2.VideoCapture] = None
         self._current_video_total = 0
+        self._best_match_idx: Optional[int] = None
         self._handshape_paths: list[Path] = []
         self._handshape_frames: list[np.ndarray] = []
         self._handshape_cache: dict[str, list[Path]] = {}  # origin_no -> paths (빈 리스트 = 확인함, 없음)
         self._handshape_thread: Optional[HandshapeFetchThread] = None
         self._my_kf_frames: list[np.ndarray] = []
-        self._my_kf_cache: dict[str, list] = {}  # origin_no -> frames, NAS 재읽기 방지
+        self._my_video_path: Optional[Path] = None
+        self._my_kf_cache: dict[str, tuple] = {}  # origin_no -> (frames, video_path|None), NAS 재읽기 방지
         self._ref_kf_frames: list[np.ndarray] = []
         self._ref_kf_sources: list[str] = []
-        self._ref_kf_cache: dict[str, tuple] = {}  # gloss_name -> (frames, sources), NAS 재읽기 방지
+        self._ref_video_path: Optional[Path] = None
+        self._ref_kf_cache: dict[str, tuple] = {}  # gloss_name -> (frames, sources, video_path|None)
         self._kf_thread: Optional[KeyframeLoadThread] = None
         self._extractors: Optional[Extractors] = None  # 지연 로딩 (첫 비교 때 한 번만 모델 로드)
         self._validating_origin_no: Optional[str] = None
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._on_play_tick)
+        self._my_video_cap: Optional[cv2.VideoCapture] = None
+        self._ref_video_cap: Optional[cv2.VideoCapture] = None
+        self._my_play_timer = QTimer(self)
+        self._my_play_timer.timeout.connect(lambda: self._on_side_play_tick("my"))
+        self._ref_play_timer = QTimer(self)
+        self._ref_play_timer.timeout.connect(lambda: self._on_side_play_tick("ref"))
 
         self._init_ui()
         self._try_autoload_exception_csv()
@@ -309,6 +318,11 @@ class MainWindow(QMainWindow):
             "검토 대상 키프레임 (지금 선택한 항목 — 예외처리된 항목이면 그 영상)",
             self._on_my_kf_slider_moved,
         )
+        self.btn_my_play = QPushButton("▶ 이 영상 재생")
+        self.btn_my_play.setToolTip("이 인스턴스의 실제 영상 전체를 재생합니다 (NAS 필요).")
+        self.btn_my_play.setEnabled(False)
+        self.btn_my_play.clicked.connect(lambda: self._toggle_side_play("my"))
+        left_box.addWidget(self.btn_my_play)
         btn_manual_kf = QPushButton("키프레임 이미지 직접 지정...")
         btn_manual_kf.clicked.connect(self._pick_manual_keyframe)
         left_box.addWidget(btn_manual_kf)
@@ -319,6 +333,11 @@ class MainWindow(QMainWindow):
         ref_ex_box, self.ref_kf_label, self.ref_kf_slider, self.ref_kf_idx_label = self._build_slider_panel(
             "정답 키프레임 (같은 글로스의 다른 정상 영상)", self._on_ref_kf_slider_moved
         )
+        self.btn_ref_play = QPushButton("▶ 이 영상 재생")
+        self.btn_ref_play.setToolTip("같은 글로스의 다른 정상 영상(있으면) 전체를 재생합니다.")
+        self.btn_ref_play.setEnabled(False)
+        self.btn_ref_play.clicked.connect(lambda: self._toggle_side_play("ref"))
+        ref_ex_box.addWidget(self.btn_ref_play)
         self.ref_kf_source_label = QLabel("")
         self.ref_kf_source_label.setWordWrap(True)
         self.ref_kf_source_label.setStyleSheet("color:#666;")
@@ -343,6 +362,10 @@ class MainWindow(QMainWindow):
         self.btn_play.clicked.connect(self._toggle_play)
         self.btn_play.setEnabled(False)
         play_row.addWidget(self.btn_play)
+        self.btn_jump_to_match = QPushButton("⭐ 최고매칭 프레임으로 이동")
+        self.btn_jump_to_match.setEnabled(False)
+        self.btn_jump_to_match.clicked.connect(self._jump_to_best_match)
+        play_row.addWidget(self.btn_jump_to_match)
         mid_box.addLayout(play_row)
         btn_open_site = QPushButton("사전 사이트에서 직접 열기")
         btn_open_site.clicked.connect(self._open_in_browser)
@@ -738,26 +761,35 @@ class MainWindow(QMainWindow):
         # 내 키프레임 + 기준 이미지 표시. NAS 읽기가 항목당 4~5초씩 걸리는 게
         # 확인돼서, 캐시에 없으면 메인 스레드를 막지 않게 백그라운드로 돌린다.
         origin_no = entry.origin_no
+        self._stop_side_play("my")
+        self._stop_side_play("ref")
         my_cached = self._my_kf_cache.get(origin_no)
         ref_cached = self._ref_kf_cache.get(entry.gloss_name)
 
         if my_cached is not None:
-            self._my_kf_frames = my_cached
+            self._my_kf_frames, my_video_str = my_cached
+            self._my_video_path = Path(my_video_str) if my_video_str else None
             self._set_slider_frames(self.my_kf_slider, self.my_kf_label, self.my_kf_idx_label,
                                      self._my_kf_frames, "(이 영상 인스턴스 키프레임 없음 - NAS 데이터셋 루트\n미마운트 또는 직접 지정 필요. keyframe_images는\n글로스 공통이라 여기엔 안 씀)")
+            self.btn_my_play.setEnabled(self._my_video_path is not None)
             log.debug(f"[gui]   내 키프레임: 캐시 사용, {len(self._my_kf_frames)}장")
         else:
             self.my_kf_label.setText("(불러오는 중... NAS 읽기라 몇 초 걸릴 수 있음)")
             self.my_kf_slider.setRange(0, 0)
             self.my_kf_idx_label.setText("- / -")
+            self.btn_my_play.setEnabled(False)
 
         if ref_cached is not None:
-            self._ref_kf_frames, ref_sources = ref_cached
+            self._ref_kf_frames, ref_sources, ref_video_str = ref_cached
             self._ref_kf_sources = ref_sources
+            self._ref_video_path = Path(ref_video_str) if ref_video_str else None
             self._set_slider_frames(self.ref_kf_slider, self.ref_kf_label, self.ref_kf_idx_label,
                                      self._ref_kf_frames, "(같은 글로스의 다른 정상 영상을 못 찾음)")
             self.ref_kf_source_label.setText(ref_sources[0] if ref_sources else "")
+            self.btn_ref_play.setEnabled(self._ref_video_path is not None)
             log.debug(f"[gui]   기준 이미지: 캐시 사용, {len(self._ref_kf_frames)}장")
+        else:
+            self.btn_ref_play.setEnabled(False)
 
         if my_cached is None or ref_cached is None:
             if self._kf_thread is not None and self._kf_thread.isRunning():
@@ -775,15 +807,19 @@ class MainWindow(QMainWindow):
         if result and result.video_path and Path(result.video_path).exists():
             self._current_video_cap = cv2.VideoCapture(result.video_path)
             self._current_video_total = int(self._current_video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            self._best_match_idx = result.best_frame_idx
             self.frame_slider.blockSignals(True)
             self.frame_slider.setRange(0, max(0, self._current_video_total - 1))
             self.frame_slider.setValue(result.best_frame_idx or 0)
             self.frame_slider.blockSignals(False)
             self._show_video_frame(result.best_frame_idx or 0)
             self.btn_play.setEnabled(True)
+            self.btn_jump_to_match.setEnabled(result.best_frame_idx is not None)
             log.debug(f"[gui]   사전 동영상(로컬 캐시) 열기: {time.perf_counter() - t0:.3f}초")
         else:
+            self._best_match_idx = None
             self.btn_play.setEnabled(False)
+            self.btn_jump_to_match.setEnabled(False)
             self.site_frame_label.setText("(아직 검증 안 됨)")
             self.site_frame_label.setPixmap(QPixmap())
             self.frame_slider.setRange(0, 0)
@@ -831,27 +867,31 @@ class MainWindow(QMainWindow):
         self.btn_restore.setEnabled(is_exc)
         self.btn_mark_exception.setEnabled(not is_exc)
 
-    def _on_keyframe_loaded(self, origin_no: str, my_frames: list, gloss_name: str,
-                             ref_frames: list, ref_sources: list):
+    def _on_keyframe_loaded(self, origin_no: str, my_frames: list, my_video_path: str,
+                             gloss_name: str, ref_frames: list, ref_sources: list, ref_video_path: str):
         """KeyframeLoadThread가 NAS에서 다 읽어온 뒤 호출됨. 캐시에 저장해두고,
         지금도 그 행/글로스를 보고 있으면 화면을 갱신한다(그 사이 다른 행을
         클릭했으면 화면은 안 건드리고 캐시만 채워둠)."""
-        self._my_kf_cache[origin_no] = my_frames
-        self._ref_kf_cache[gloss_name] = (ref_frames, ref_sources)
+        self._my_kf_cache[origin_no] = (my_frames, my_video_path or None)
+        self._ref_kf_cache[gloss_name] = (ref_frames, ref_sources, ref_video_path or None)
 
         entry = self._selected_entry()
         if entry is None:
             return
         if entry.origin_no == origin_no:
             self._my_kf_frames = my_frames
+            self._my_video_path = Path(my_video_path) if my_video_path else None
             self._set_slider_frames(self.my_kf_slider, self.my_kf_label, self.my_kf_idx_label,
                                      my_frames, "(이 영상 인스턴스 키프레임 없음 - NAS 데이터셋 루트\n미마운트 또는 직접 지정 필요. keyframe_images는\n글로스 공통이라 여기엔 안 씀)")
+            self.btn_my_play.setEnabled(self._my_video_path is not None)
         if entry.gloss_name == gloss_name:
             self._ref_kf_frames = ref_frames
             self._ref_kf_sources = ref_sources
+            self._ref_video_path = Path(ref_video_path) if ref_video_path else None
             self._set_slider_frames(self.ref_kf_slider, self.ref_kf_label, self.ref_kf_idx_label,
                                      ref_frames, "(같은 글로스의 다른 정상 영상을 못 찾음)")
             self.ref_kf_source_label.setText(ref_sources[0] if ref_sources else "")
+            self.btn_ref_play.setEnabled(self._ref_video_path is not None)
 
     def _set_slider_frames(self, slider: QSlider, img_label: QLabel, idx_label: QLabel,
                             frames: list, empty_text: str):
@@ -1053,7 +1093,12 @@ class MainWindow(QMainWindow):
         if ret:
             # 포즈 표시 체크박스 켰을 때만 오버레이 비용이 붙는다 - 기본(꺼짐)은 그대로 빠름
             self._display_frame(self.site_frame_label, frame)
-        self.frame_idx_label.setText(f"프레임: {idx} / {self._current_video_total - 1}")
+        star = " ⭐ 최고매칭 프레임" if self._best_match_idx is not None and idx == self._best_match_idx else ""
+        self.frame_idx_label.setText(f"프레임: {idx} / {self._current_video_total - 1}{star}")
+
+    def _jump_to_best_match(self):
+        if self._best_match_idx is not None:
+            self.frame_slider.setValue(self._best_match_idx)
 
     def _toggle_play(self):
         if self._play_timer.isActive():
@@ -1076,6 +1121,54 @@ class MainWindow(QMainWindow):
             self.btn_play.setText("▶ 재생")
             return
         self.frame_slider.setValue(next_idx)  # valueChanged가 _on_slider_moved를 호출해 화면 갱신
+
+    # ── 검토대상/정답 패널 동영상 재생 (기존 후보-슬라이더는 그대로 두고, 이 버튼을
+    #    누르면 그 인스턴스의 실제 영상 전체를 처음부터 순서대로 재생한다) ──────────
+    def _side_widgets(self, which: str) -> dict:
+        if which == "my":
+            return {
+                "path": self._my_video_path, "cap_attr": "_my_video_cap",
+                "timer": self._my_play_timer, "label": self.my_kf_label, "button": self.btn_my_play,
+            }
+        return {
+            "path": self._ref_video_path, "cap_attr": "_ref_video_cap",
+            "timer": self._ref_play_timer, "label": self.ref_kf_label, "button": self.btn_ref_play,
+        }
+
+    def _toggle_side_play(self, which: str):
+        w = self._side_widgets(which)
+        if w["timer"].isActive():
+            self._stop_side_play(which)
+            return
+        if w["path"] is None:
+            return
+        cap = cv2.VideoCapture(str(w["path"]))
+        setattr(self, w["cap_attr"], cap)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        interval_ms = max(1, int(1000 / fps))
+        w["button"].setText("⏸ 정지")
+        w["timer"].start(interval_ms)
+
+    def _on_side_play_tick(self, which: str):
+        w = self._side_widgets(which)
+        cap = getattr(self, w["cap_attr"])
+        if cap is None:
+            self._stop_side_play(which)
+            return
+        ret, frame = cap.read()
+        if not ret:
+            self._stop_side_play(which)  # 끝까지 재생함 - 정지하고 마지막 프레임 유지
+            return
+        self._display_frame(w["label"], frame)
+
+    def _stop_side_play(self, which: str):
+        w = self._side_widgets(which)
+        w["timer"].stop()
+        w["button"].setText("▶ 이 영상 재생")
+        cap = getattr(self, w["cap_attr"])
+        if cap is not None:
+            cap.release()
+            setattr(self, w["cap_attr"], None)
 
     # ── 리뷰 액션 ──────────────────────────────────────────────────────
     def _confirm_ok(self):
@@ -1203,6 +1296,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._release_current_cap()
+        self._stop_side_play("my")
+        self._stop_side_play("ref")
         if self.worker and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait(2000)
