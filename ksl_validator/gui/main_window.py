@@ -269,7 +269,8 @@ class MainWindow(QMainWindow):
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setSortingEnabled(True)
         self.table.setAlternatingRowColors(True)
-        self.table.setColumnWidth(1, 140)  # gloss_name - Stretch로 두면 너무 넓어져서 고정폭으로
+        self.table.setColumnWidth(1, 180)  # gloss_name
+        self.table.setColumnWidth(2, 180)  # video_id(subset/사람) - gloss_name과 같은 폭
         self.table.horizontalHeader().setSectionResizeMode(len(COLS) - 1, QHeaderView.Stretch)  # 비고
         self.table.itemSelectionChanged.connect(self._on_row_selected)
         return self.table
