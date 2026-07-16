@@ -39,6 +39,18 @@ from ..user_info import safe_getuser
 from .worker import HandshapeFetchThread, KeyframeLoadThread, ValidationWorker
 
 IMG_W, IMG_H = 320, 240
+
+# YOLO COCO 17-keypoint 스켈레톤 연결선 (팔/어깨/골반/다리만 - 얼굴은 판별에 안 씀)
+BODY_EDGES = [
+    (5, 7), (7, 9), (6, 8), (8, 10),  # 팔
+    (5, 6), (5, 11), (6, 12), (11, 12),  # 몸통
+    (11, 13), (13, 15), (12, 14), (14, 16),  # 다리
+]
+# MediaPipe 21점 손가락 체인 (엄지/검지/중지/약지/새끼)
+HAND_CHAINS = [
+    (0, 1, 2, 3, 4), (0, 5, 6, 7, 8), (0, 9, 10, 11, 12), (0, 13, 14, 15, 16), (0, 17, 18, 19, 20),
+]
+
 DEFAULT_CACHE_DIR = VIDEOS_CACHE_DIR
 DEFAULT_HANDSHAPE_DIR = HANDSHAPE_CACHE_DIR
 DEFAULT_REVIEW_LOG = REVIEW_LOG_PATH
@@ -191,6 +203,14 @@ class MainWindow(QMainWindow):
         self.only_exceptions_cb.stateChanged.connect(lambda _checked: self._refresh_table())
         row1.addWidget(self.only_exceptions_cb)
 
+        self.show_pose_cb = QCheckBox("포즈/손 keypoint 시각적으로 표시")
+        self.show_pose_cb.setToolTip(
+            "검토대상/정답 키프레임 위에 YOLO body pose + MediaPipe 손가락 keypoint를 그려서 보여줍니다. "
+            "실제로 뭘 검출하는지 눈으로 바로 확인할 수 있어요 (첫 사용시 모델 로딩으로 잠깐 걸릴 수 있음)."
+        )
+        self.show_pose_cb.stateChanged.connect(self._on_show_pose_toggled)
+        row1.addWidget(self.show_pose_cb)
+
         row1.addStretch()
         box.addLayout(row1)
 
@@ -302,6 +322,14 @@ class MainWindow(QMainWindow):
         self.ref_kf_source_label.setWordWrap(True)
         self.ref_kf_source_label.setStyleSheet("color:#666;")
         ref_ex_box.addWidget(self.ref_kf_source_label)
+        self.my_vs_ref_label = QLabel("검토대상 vs 정답 직접비교: -")
+        self.my_vs_ref_label.setWordWrap(True)
+        self.my_vs_ref_label.setStyleSheet("font-weight:bold;")
+        ref_ex_box.addWidget(self.my_vs_ref_label)
+        btn_compare = QPushButton("지금 보이는 프레임끼리 직접 비교")
+        btn_compare.setToolTip("첫 사용시 모델 로딩으로 1~2초 걸릴 수 있습니다.")
+        btn_compare.clicked.connect(self._update_my_vs_ref_score)
+        ref_ex_box.addWidget(btn_compare)
         ref_ex_box.addStretch()
         layout.addLayout(ref_ex_box)
 
@@ -702,6 +730,7 @@ class MainWindow(QMainWindow):
         t_total = time.perf_counter()
         log.info(f"[gui] 행 선택: origin_no={entry.origin_no} ({entry.gloss_name})")
         self._release_current_cap()
+        self.my_vs_ref_label.setText("검토대상 vs 정답 직접비교: -")
         result = self.results.get(entry.origin_no)
         is_exc = self.exception_store.is_exception(entry.origin_no) if self.exception_store else False
 
@@ -832,16 +861,93 @@ class MainWindow(QMainWindow):
         slider.setValue(0)
         slider.blockSignals(False)
         if frames:
-            img_label.setPixmap(cv2_to_pixmap(frames[0]))
+            self._display_frame(img_label, frames[0])
             idx_label.setText(f"1 / {len(frames)}")
         else:
             img_label.setText(empty_text)
             idx_label.setText("- / -")
 
+    def _display_frame(self, img_label: QLabel, frame: np.ndarray):
+        """포즈 시각화 체크박스가 켜져 있으면 keypoint를 그려서 보여준다."""
+        if self.show_pose_cb.isChecked():
+            frame = self._draw_pose_overlay(frame)
+        img_label.setPixmap(cv2_to_pixmap(frame))
+
+    def _get_extractors(self) -> Extractors:
+        """YOLO+MediaPipe 모델을 첫 사용 시 한 번만 로드해서 재사용 (로딩에 1~2초 걸림)."""
+        if self._extractors is None:
+            log.info("[gui] pose 시각화/직접비교용 모델 로딩 중...")
+            t0 = time.perf_counter()
+            self._extractors = Extractors()
+            log.info(f"[gui] 모델 로딩 완료: {time.perf_counter() - t0:.3f}초")
+        return self._extractors
+
+    def _draw_pose_overlay(self, frame: np.ndarray) -> np.ndarray:
+        """YOLO body keypoint(초록 선/점) + MediaPipe 손가락 keypoint(왼손 파랑/오른손 빨강)를
+        프레임 위에 그려서, 실제로 뭘 검출하고 있는지 눈으로 확인할 수 있게 한다."""
+        try:
+            extractors = self._get_extractors()
+            sig = extractors.signature(frame)
+        except Exception as e:  # noqa: BLE001 - 시각화 실패해도 원본은 보여줘야 함
+            log.debug(f"[gui] pose 오버레이 실패: {e}")
+            return frame
+
+        vis = frame.copy()
+        if sig.body is not None:
+            body = sig.body
+            for a, b in BODY_EDGES:
+                if body[a][2] > 0.3 and body[b][2] > 0.3:
+                    pa = (int(body[a][0]), int(body[a][1]))
+                    pb = (int(body[b][0]), int(body[b][1]))
+                    cv2.line(vis, pa, pb, (0, 255, 0), 2)
+            for x, y, c in body:
+                if c > 0.3:
+                    cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 255), -1)
+
+        h, w = frame.shape[:2]
+        for label, pts in sig.hands.items():
+            color = (255, 0, 0) if label == "Left" else (0, 0, 255)
+            px = [(int(x * w), int(y * h)) for x, y in pts]
+            for chain in HAND_CHAINS:
+                for i in range(len(chain) - 1):
+                    cv2.line(vis, px[chain[i]], px[chain[i + 1]], color, 1)
+            for p in px:
+                cv2.circle(vis, p, 2, color, -1)
+        return vis
+
+    def _on_show_pose_toggled(self, _checked):
+        """체크박스를 바꾸면 지금 보이는 프레임을 다시 그린다(다시 클릭할 필요 없게)."""
+        if self._my_kf_frames:
+            self._display_frame(self.my_kf_label, self._my_kf_frames[self.my_kf_slider.value()])
+        if self._ref_kf_frames:
+            self._display_frame(self.ref_kf_label, self._ref_kf_frames[self.ref_kf_slider.value()])
+
+    def _update_my_vs_ref_score(self):
+        """'검토대상 키프레임'과 '정답 키프레임' 중 지금 슬라이더로 보고 있는
+        프레임끼리 직접 pose 비교 점수를 계산해서 보여준다."""
+        if not self._my_kf_frames or not self._ref_kf_frames:
+            self.my_vs_ref_label.setText("검토대상 vs 정답 직접비교: 두 이미지가 다 있어야 계산 가능")
+            return
+        try:
+            extractors = self._get_extractors()
+            a = extractors.signature(self._my_kf_frames[self.my_kf_slider.value()])
+            b = extractors.signature(self._ref_kf_frames[self.ref_kf_slider.value()])
+            score, _detail = combined_similarity(a.body, b.body, a.hands, b.hands)
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"[gui] 직접비교 실패: {e}")
+            self.my_vs_ref_label.setText("검토대상 vs 정답 직접비교: 계산 실패")
+            return
+
+        if score is None:
+            self.my_vs_ref_label.setText("검토대상 vs 정답 직접비교: 사람/손 검출 실패")
+            return
+        verdict = "일치 가능성 높음" if score >= self.threshold_spin.value() else "불일치 의심"
+        self.my_vs_ref_label.setText(f"검토대상 vs 정답 직접비교: {score:.4f} ({verdict})")
+
     def _on_my_kf_slider_moved(self, idx: int):
         if not self._my_kf_frames:
             return
-        self.my_kf_label.setPixmap(cv2_to_pixmap(self._my_kf_frames[idx]))
+        self._display_frame(self.my_kf_label, self._my_kf_frames[idx])
         self.my_kf_idx_label.setText(f"{idx + 1} / {len(self._my_kf_frames)}")
 
     def _find_reference_entries(self, entry: DatasetEntry) -> list[DatasetEntry]:
@@ -859,7 +965,7 @@ class MainWindow(QMainWindow):
     def _on_ref_kf_slider_moved(self, idx: int):
         if not self._ref_kf_frames:
             return
-        self.ref_kf_label.setPixmap(cv2_to_pixmap(self._ref_kf_frames[idx]))
+        self._display_frame(self.ref_kf_label, self._ref_kf_frames[idx])
         self.ref_kf_idx_label.setText(f"{idx + 1} / {len(self._ref_kf_frames)}")
         if idx < len(self._ref_kf_sources):
             self.ref_kf_source_label.setText(self._ref_kf_sources[idx])
