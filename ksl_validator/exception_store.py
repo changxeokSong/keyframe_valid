@@ -119,10 +119,16 @@ class ExceptionStore:
         self._restore_requests: dict[tuple[str, str], tuple[str, str]] = {}
         # origin_no -> [(reviewer_label, ExceptionRow), ...]  (조회 전용 인덱스, load/변경 시마다 재생성)
         self._rows_by_origin: dict[str, list[tuple[str, ExceptionRow]]] = {}
+        # origin_no -> [video_id, ...] ("" 포함 가능 = 그 origin_no 전체에 폭넓게 매칭)
+        self._restore_by_origin: dict[str, list[str]] = {}
 
         self.load()
 
     def _rebuild_index(self) -> None:
+        self._restore_by_origin = {}
+        for (o, v) in self._restore_requests:
+            self._restore_by_origin.setdefault(o, []).append(v)
+
         self._rows_by_origin = {}
         for reviewer, rows in self._source_by_reviewer.items():
             for row in rows.values():
@@ -192,8 +198,8 @@ class ExceptionStore:
 
     # ── 조회 (원본 ∪ 스테이징, 복구요청은 원본 쪽만 마스킹) ─────────────
     def _is_restore_masked(self, row: "ExceptionRow") -> bool:
-        for (o, v) in self._restore_requests:
-            if o == row.origin_no and (not v or not row.video_id or v.strip() == row.video_id.strip()):
+        for v in self._restore_by_origin.get(row.origin_no, ()):
+            if not v or not row.video_id or v.strip() == row.video_id.strip():
                 return True
         return False
 
@@ -211,8 +217,8 @@ class ExceptionStore:
         return len(self._all_reviewers_raw(origin_no, video_id)) > 0
 
     def is_restore_requested(self, origin_no: str, video_id: str = "") -> bool:
-        for (o, v) in self._restore_requests:
-            if o == origin_no and (not v or not video_id or v.strip() == video_id.strip()):
+        for v in self._restore_by_origin.get(origin_no, ()):
+            if not v or not video_id or v.strip() == video_id.strip():
                 return True
         return False
 
@@ -272,19 +278,29 @@ class ExceptionStore:
     # ── 변경 (전부 로컬 스테이징에만 기록, 원본 파일 write 없음) ─────────
     def mark_exception(self, origin_no: str, gloss_name: str, video_id: str = "", reviewer: str | None = None,
                         reason: str = "") -> None:
+        self.mark_exception_bulk([(origin_no, gloss_name, video_id)], reviewer=reviewer, reason=reason)
+
+    def mark_exception_bulk(self, items: list[tuple[str, str, str]], reviewer: str | None = None,
+                             reason: str = "") -> None:
+        """mark_exception 여러 개를 한 번에 처리한다. 항목마다 스테이징 CSV 전체를
+        다시 쓰고 조회 인덱스를 재생성하면(구버전 동작) 대량 선택 시 O(N*M)으로
+        느려지므로(수백 개 선택하면 GUI가 몇 초씩 멈춤, 직접 확인됨), 파일 저장과
+        인덱스 재생성은 전부 끝난 뒤 딱 한 번만 한다."""
         reviewer = reviewer or self.reviewer
-        resolved_video_id = video_id or f"(video_id 불명, origin_no={origin_no}로 대체)"
-        self._staging_by_reviewer.setdefault(reviewer, {})[_row_key(origin_no, resolved_video_id)] = ExceptionRow(
-            video_id=resolved_video_id,
-            origin_no=origin_no,
-            gloss_name=gloss_name,
-            moved_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            reason=reason,
-            source="staging",
-        )
-        self._save_staging_reviewer(reviewer)
-        self._append_history(reviewer, origin_no, gloss_name, video_id, "EXCEPTION", reason)
-        self._rebuild_index()
+        for origin_no, gloss_name, video_id in items:
+            resolved_video_id = video_id or f"(video_id 불명, origin_no={origin_no}로 대체)"
+            self._staging_by_reviewer.setdefault(reviewer, {})[_row_key(origin_no, resolved_video_id)] = ExceptionRow(
+                video_id=resolved_video_id,
+                origin_no=origin_no,
+                gloss_name=gloss_name,
+                moved_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                reason=reason,
+                source="staging",
+            )
+            self._append_history(reviewer, origin_no, gloss_name, video_id, "EXCEPTION", reason)
+        if items:
+            self._save_staging_reviewer(reviewer)
+            self._rebuild_index()
 
     def restore(self, origin_no: str, video_id: str = "", reviewer: str | None = None) -> bool:
         """로컬 스테이징에만 있던 항목이면 그냥 제거. 원본(NAS 등)에 있던 항목이면
@@ -292,29 +308,46 @@ class ExceptionStore:
         video_id를 주면 그 사람 영상만 복구하고, 같은 origin_no의 다른 사람 영상은
         건드리지 않는다(주지 않으면 옛날 방식대로 origin_no 전체에 폭넓게 매칭).
         """
+        return self.restore_bulk([(origin_no, video_id)], reviewer=reviewer) > 0
+
+    def restore_bulk(self, items: list[tuple[str, str]], reviewer: str | None = None) -> int:
+        """restore 여러 개를 한 번에 처리한다(이유는 mark_exception_bulk와 동일 -
+        대량 선택 시 매 항목마다 파일 전체를 다시 쓰던 O(N*M) 비용을 없앤다).
+        반환값은 실제로 뭔가 바뀐 항목 개수."""
         reviewer = reviewer or self.reviewer
-        changed = False
+        changed_count = 0
+        touched_reviewers: set[str] = set()
+        any_restore_request = False
 
-        for rev, rows in list(self._staging_by_reviewer.items()):
-            for key in [k for k, row in rows.items() if row.origin_no == origin_no and _row_matches(row, video_id)]:
-                row = rows.pop(key)
-                self._save_staging_reviewer(rev)
-                self._append_history(rev, origin_no, row.gloss_name, row.video_id, "RESTORED_LOCAL")
-                changed = True
+        for origin_no, video_id in items:
+            item_changed = False
+            for rev, rows in list(self._staging_by_reviewer.items()):
+                for key in [k for k, row in rows.items() if row.origin_no == origin_no and _row_matches(row, video_id)]:
+                    row = rows.pop(key)
+                    self._append_history(rev, origin_no, row.gloss_name, row.video_id, "RESTORED_LOCAL")
+                    touched_reviewers.add(rev)
+                    item_changed = True
 
-        source_matches = [
-            row for rows in self._source_by_reviewer.values() for row in rows.values()
-            if row.origin_no == origin_no and _row_matches(row, video_id)
-        ]
-        for row in source_matches:
-            rq_key = (origin_no, row.video_id)
-            if rq_key not in self._restore_requests:
-                self._restore_requests[rq_key] = (reviewer, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-                changed = True
-        if source_matches:
+            source_matches = [
+                row for rows in self._source_by_reviewer.values() for row in rows.values()
+                if row.origin_no == origin_no and _row_matches(row, video_id)
+            ]
+            for row in source_matches:
+                rq_key = (origin_no, row.video_id)
+                if rq_key not in self._restore_requests:
+                    self._restore_requests[rq_key] = (reviewer, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    item_changed = True
+            if source_matches:
+                any_restore_request = True
+                self._append_history(reviewer, origin_no, "", video_id, "RESTORE_REQUESTED(NAS 미반영)")
+
+            if item_changed:
+                changed_count += 1
+
+        for rev in touched_reviewers:
+            self._save_staging_reviewer(rev)
+        if any_restore_request:
             self._save_restore_requests()
-            self._append_history(reviewer, origin_no, "", video_id, "RESTORE_REQUESTED(NAS 미반영)")
-
-        if changed:
+        if changed_count:
             self._rebuild_index()
-        return changed
+        return changed_count

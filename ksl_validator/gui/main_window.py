@@ -272,7 +272,10 @@ class MainWindow(QMainWindow):
         row1.setSpacing(8)
 
         btn_cfg = QPushButton("설정파일(dataset.json) 자동 불러오기")
-        btn_cfg.clicked.connect(self._try_autoload_dataset_config)
+        # QPushButton.clicked는 (checked: bool)을 넘기므로 직접 연결하면 그 값이
+        # force 자리에 들어가 버린다(항상 False) - 버튼을 눌렀을 때는 항상 다시
+        # 탐색해야 하므로 명시적으로 force=True를 넘긴다.
+        btn_cfg.clicked.connect(lambda: self._try_autoload_dataset_config(force=True))
         row1.addWidget(btn_cfg)
 
         btn_meta = QPushButton("메타데이터 열기 (xlsx/csv)")
@@ -714,14 +717,23 @@ class MainWindow(QMainWindow):
 
         self._update_source_status_label()
 
-    def _try_autoload_dataset_config(self):
+    def _try_autoload_dataset_config(self, force: bool = False):
         """tools/tagging/config/dataset.json 을 읽어 NAS 경로들을 자동으로 채운다.
         NAS가 마운트 안 돼 있으면 경로만 채우고 상태 라벨에 '미마운트'로 표시한다.
         exception_*.csv / exception_history_*.csv 는 dataset_root와 같은 폴더에
         검토자별로 흩어져 있으므로, dataset_root가 마운트되면 그 폴더를
         예외처리 디렉토리로 자동 지정한다(단, 사용자가 이미 다른 소스를 지정했으면 덮어쓰지 않음).
         로컬에 저장된 이전 지정값이 있으면 그게 우선이고, 이 자동추측은 빈 곳만 채운다.
-        """
+
+        load_dataset_config()는 경로 4개마다 존재 여부를 여러 후보로 확인하는데,
+        윈도우에서는 경로당 드라이브 문자 A~Z까지 훑어서(_unc_candidates) 꽤 느리다
+        (직접 확인: 실행할 때마다 체감되는 지연). 로컬 설정으로 이미 다 채워져 있으면
+        (dataset_root/keyframe_images_dir/entries 전부) 매번 다시 탐색할 필요가 없으므로
+        건너뛴다 - 단, 버튼으로 명시적으로 누른 경우(force=True)는 항상 다시 탐색한다."""
+        if not force and self.dataset_root is not None and self.keyframe_images_dir is not None and self.entries:
+            self._update_source_status_label()
+            return
+
         cfg = load_dataset_config(DEFAULT_CONFIG_PATH)
         if cfg is None:
             self._update_source_status_label()
@@ -1540,10 +1552,12 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
+        # 대량 선택 시 항목마다 스테이징 CSV 전체를 다시 쓰면(예전 동작) O(N*M)으로
+        # 느려지므로(직접 확인: 수백 개 선택시 몇 초씩 멈춤), 한 번에 처리한다.
+        self.exception_store.mark_exception_bulk(
+            [(e.origin_no, e.gloss_name, e.video_id or "") for e in targets], reason=reason.strip()
+        )
         for entry in targets:
-            self.exception_store.mark_exception(
-                entry.origin_no, entry.gloss_name, entry.video_id or "", reason=reason.strip()
-            )
             self._append_review_log(entry, "EXCEPTION", reason.strip())
             self._fill_row_by_origin(entry_key(entry))
 
@@ -1572,9 +1586,10 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
+        # mark_exception_bulk와 같은 이유로 한 번에 처리(대량 선택 시 O(N*M) 방지).
+        self.exception_store.restore_bulk([(e.origin_no, e.video_id or "") for e in targets])
         for entry in targets:
-            if self.exception_store.restore(entry.origin_no, entry.video_id or ""):
-                self._append_review_log(entry, "RESTORED")
+            self._append_review_log(entry, "RESTORED")
             self._fill_row_by_origin(entry_key(entry))
 
         sel = self._selected_entry()
