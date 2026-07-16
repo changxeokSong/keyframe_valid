@@ -66,6 +66,16 @@ def load_gloss_reference_images(entry, keyframe_images_dir: Optional[Path] = Non
     return frames
 
 
+def resolve_instance_video_path(entry, dataset_root: Optional[Path]) -> Optional[Path]:
+    """entry가 가리키는 그 특정 인스턴스의 실제 영상 파일 경로 (재생용).
+    gloss_reference_images(글로스 공통 사진)에는 대응하는 영상이 없으므로 None."""
+    if dataset_root is not None and getattr(entry, "video_rel_path", None):
+        p = Path(dataset_root) / entry.video_rel_path
+        if p.exists():
+            return p
+    return None
+
+
 def load_instance_keyframes(entry, dataset_root: Optional[Path] = None,
                              manual_override: Optional[Path] = None) -> list[np.ndarray]:
     """'검토 대상' 전용: 지금 선택된 그 특정 영상 인스턴스(사람/subset) 자체의

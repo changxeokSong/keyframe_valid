@@ -54,6 +54,54 @@ def pose_similarity(kpts_a: np.ndarray | None, kpts_b: np.ndarray | None) -> flo
     return score
 
 
+# ── 손 위치(어디 근처인지) 비교 ──────────────────────────────────────────
+# hand_shape_similarity는 손목을 원점으로 다시 정규화하기 때문에 완전히
+# 위치 무관(position-invariant)하다 - 손이 눈 앞이든 가슴 앞이든 손모양만
+# 같으면 똑같이 취급된다. 그런데 수어는 "손을 어디 근처에 두는지"(눈/코/입/
+# 어깨/가슴 등)도 뜻을 가르는 핵심 요소라서, 손목과 주요 신체 랜드마크
+# 사이의 거리를 정규화 좌표계에서 명시적으로 비교하는 신호를 따로 둔다.
+PROXIMITY_LANDMARKS = {
+    "nose": 0, "left_eye": 1, "right_eye": 2,
+    "left_shoulder": 5, "right_shoulder": 6,
+    "left_hip": 11, "right_hip": 12,
+}
+WRIST_INDICES = {"left": 9, "right": 10}
+
+
+def _wrist_proximity_features(norm_kpts: np.ndarray) -> dict[str, float]:
+    """정규화된 (17,2) 좌표에서 '손목 -> 주요 랜드마크' 거리들을 계산한다."""
+    feats: dict[str, float] = {}
+    for wrist_name, wrist_idx in WRIST_INDICES.items():
+        wrist = norm_kpts[wrist_idx]
+        if np.isnan(wrist).any():
+            continue
+        for lm_name, lm_idx in PROXIMITY_LANDMARKS.items():
+            lm = norm_kpts[lm_idx]
+            if np.isnan(lm).any():
+                continue
+            feats[f"{wrist_name}_wrist_to_{lm_name}"] = float(np.linalg.norm(wrist - lm))
+    return feats
+
+
+def hand_position_similarity(kpts_a: np.ndarray | None, kpts_b: np.ndarray | None) -> float | None:
+    """손목이 눈/코/어깨/가슴(골반) 등에서 얼마나 가까운지가 양쪽에서 비슷한지 비교.
+    0~1, 겹치는 특징이 없으면 None."""
+    a = normalize_keypoints(kpts_a)
+    b = normalize_keypoints(kpts_b)
+    if a is None or b is None:
+        return None
+
+    fa = _wrist_proximity_features(a)
+    fb = _wrist_proximity_features(b)
+    common = set(fa) & set(fb)
+    if not common:
+        return None
+
+    avg_diff = float(np.mean([abs(fa[k] - fb[k]) for k in common]))
+    # 어깨폭 기준 거리차. 0 -> 1.0, >=1.0(어깨폭만큼 벌어짐) -> 0.0 근방
+    return max(0.0, 1.0 - avg_diff / 1.0)
+
+
 # ── 손모양(핸드셰이프) 비교 ──────────────────────────────────────────────
 # body pose는 어깨/팔꿈치/손목 위치까지만 보므로 손가락을 접었는지 폈는지
 # 구분하지 못한다. 수어는 이 손모양 차이가 뜻을 가르는 핵심이라 별도로 비교한다.
@@ -107,31 +155,41 @@ def hands_similarity(hands_a: dict, hands_b: dict) -> float | None:
     return float(np.mean(scores)) if scores else None
 
 
-# ── 종합 스코어 (body pose + 손모양) ────────────────────────────────────
-BODY_WEIGHT_WITH_HANDS = 0.3
-HAND_WEIGHT = 0.7
+# ── 종합 스코어 (body pose + 손모양 + 손 위치) ───────────────────────────
+# 손모양(어떤 모양인지)이 여전히 가장 중요하지만, 손 위치(눈 앞/코 앞/가슴 앞 등)도
+# 뜻을 가르는 핵심이라 무시할 수 없어서 별도 가중치를 준다.
+BODY_WEIGHT = 0.15
+HAND_SHAPE_WEIGHT = 0.55
+HAND_POSITION_WEIGHT = 0.30
 
 
 def combined_similarity(
     body_a: np.ndarray | None, body_b: np.ndarray | None,
     hands_a: dict, hands_b: dict,
 ) -> tuple[float | None, dict]:
-    """(종합점수, {'body': .., 'hand': .., 'hand_used': bool}) 반환.
+    """(종합점수, {'body', 'hand', 'hand_position', 'hand_used'}) 반환.
 
-    손이 양쪽에서 겹쳐 잡히면 body+hand 가중합, 아니면 body 점수만 사용하되
-    hand_used=False로 표시해 신뢰도가 낮음을 알 수 있게 한다.
+    사용 가능한 신호만 가중합하고(없는 신호는 그 가중치를 나머지에 재분배),
+    손모양이 양쪽에서 겹쳐 잡혀야 hand_used=True로 표시해 신뢰도를 알 수 있게 한다.
     """
     body_score = pose_similarity(body_a, body_b)
     hand_score = hands_similarity(hands_a, hands_b)
+    position_score = hand_position_similarity(body_a, body_b)
 
-    detail = {"body": body_score, "hand": hand_score, "hand_used": hand_score is not None}
+    detail = {
+        "body": body_score, "hand": hand_score, "hand_position": position_score,
+        "hand_used": hand_score is not None,
+    }
 
-    if body_score is None and hand_score is None:
+    weighted = [
+        (body_score, BODY_WEIGHT),
+        (hand_score, HAND_SHAPE_WEIGHT),
+        (position_score, HAND_POSITION_WEIGHT),
+    ]
+    available = [(s, w) for s, w in weighted if s is not None]
+    if not available:
         return None, detail
-    if hand_score is None:
-        return body_score, detail
-    if body_score is None:
-        return hand_score, detail
 
-    combined = BODY_WEIGHT_WITH_HANDS * body_score + HAND_WEIGHT * hand_score
+    total_w = sum(w for _, w in available)
+    combined = sum(s * w for s, w in available) / total_w
     return combined, detail
