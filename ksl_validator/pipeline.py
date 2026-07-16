@@ -28,7 +28,7 @@ import requests
 from . import sldict_client
 from .compare import combined_similarity
 from .hands import HandPoseExtractor
-from .keyframe_images import find_keyframe_images
+from .keyframe_images import find_keyframe_images, load_gloss_reference_images
 from .logging_setup import log
 from .metadata import DatasetEntry
 from .pose import PoseExtractor
@@ -41,7 +41,8 @@ STATUS_NO_POSE_DETECTED = "NO_POSE_DETECTED"
 
 REPORT_FIELDS = [
     "origin_no", "gloss_name", "status", "best_score", "best_frame_idx",
-    "keyframe_matched", "keyframe_total", "hand_used", "frames_scanned", "video_path", "note",
+    "keyframe_matched", "keyframe_total", "reference_score",
+    "hand_used", "frames_scanned", "video_path", "note",
 ]
 
 
@@ -81,6 +82,10 @@ class ValidationResult:
     keyframe_total: int = 0
     keyframe_matched: int = 0
     per_keyframe_scores: list = field(default_factory=list)
+    # 두 번째 독립 신호: 내 키프레임 vs 글로스 공통 기준사진("정답", keyframe_images).
+    # 사전 동영상 비교와 별개라서, 둘 다 낮으면 라벨 오류일 확률이 더 높다고 볼 수 있다.
+    reference_score: Optional[float] = None
+    reference_note: str = ""
 
     def as_row(self) -> dict:
         return {
@@ -91,6 +96,7 @@ class ValidationResult:
             "best_frame_idx": self.best_frame_idx if self.best_frame_idx is not None else "",
             "keyframe_matched": self.keyframe_matched,
             "keyframe_total": self.keyframe_total,
+            "reference_score": f"{self.reference_score:.4f}" if self.reference_score is not None else "",
             "hand_used": "Y" if self.hand_used else "N",
             "frames_scanned": self.frames_scanned,
             "video_path": self.video_path or "",
@@ -294,6 +300,26 @@ def validate_entry(
     if not my_sigs:
         return ValidationResult(entry.origin_no, entry.gloss_name, STATUS_NO_MY_KEYFRAME, note=note)
 
+    # 1-b) 두 번째 독립 신호: 내 키프레임 vs 글로스 공통 기준사진("정답").
+    #      my_sigs를 인스턴스 영상(dataset_root)에서 구했을 때만 의미가 있다 -
+    #      keyframe_images_dir로 my_sigs를 구한 경우(위 fallback)라면 정답을
+    #      정답과 비교하는 꼴이라 무의미하므로 건너뛴다.
+    reference_score = None
+    reference_note = ""
+    if keyframe_images_dir is not None and my_keyframe_image is None and dataset_root is not None:
+        ref_sigs, reference_note = extract_my_keyframe_signatures_from_images_dir(
+            entry, keyframe_images_dir, extractors
+        )
+        if ref_sigs:
+            best_ref = None
+            for my_sig in my_sigs:
+                for ref_sig in ref_sigs:
+                    s, _ = combined_similarity(my_sig.body, ref_sig.body, my_sig.hands, ref_sig.hands)
+                    if s is not None and (best_ref is None or s > best_ref):
+                        best_ref = s
+            reference_score = best_ref
+            log.info(f"[pipeline] origin_no={entry.origin_no} 정답(글로스 공통) 비교 점수: {reference_score}")
+
     # 2) 사전 사이트에서 동영상 다운로드
     try:
         video_path = sldict_client.fetch_and_download(
@@ -301,7 +327,8 @@ def validate_entry(
         )
     except Exception as e:  # noqa: BLE001 - 네트워크/사이트 응답 오류를 모두 리포트에 남긴다
         return ValidationResult(
-            entry.origin_no, entry.gloss_name, STATUS_DOWNLOAD_FAILED, note=str(e)
+            entry.origin_no, entry.gloss_name, STATUS_DOWNLOAD_FAILED, note=str(e),
+            reference_score=reference_score, reference_note=reference_note,
         )
 
     # 3) 프레임 전수 스캔하며, 태깅된 키프레임 각각의 최고 유사 프레임을 동시에 탐색
@@ -315,6 +342,7 @@ def validate_entry(
             entry.origin_no, entry.gloss_name, STATUS_NO_POSE_DETECTED,
             frames_scanned=scanned, video_path=str(video_path),
             keyframe_total=len(my_sigs),
+            reference_score=reference_score, reference_note=reference_note,
         )
 
     # 대표(headline) 점수는 태깅된 키프레임들 중 가장 잘 맞은 것 - 기존 동작과 호환
@@ -334,6 +362,7 @@ def validate_entry(
         frames_scanned=scanned, video_path=str(video_path),
         keyframe_total=len(my_sigs), keyframe_matched=keyframe_matched,
         per_keyframe_scores=per_keyframe_scores,
+        reference_score=reference_score, reference_note=reference_note,
     )
 
 

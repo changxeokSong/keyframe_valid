@@ -893,6 +893,8 @@ class MainWindow(QMainWindow):
                 f"최고 유사도: {result.best_score:.4f}" if result.best_score is not None else "최고 유사도: -",
                 f"최고매칭 프레임: {result.best_frame_idx}",
                 f"metadata keyframes 매칭: {result.keyframe_matched}/{result.keyframe_total}개{per_kf}",
+                (f"정답(글로스 공통) 비교: {result.reference_score:.4f}" if result.reference_score is not None
+                 else f"정답(글로스 공통) 비교: - {('(' + result.reference_note + ')') if result.reference_note else ''}"),
                 f"손모양 신호 반영: {'예' if result.hand_used else '아니오 (body pose만 사용 - 신뢰도 낮음)'}",
                 f"스캔한 프레임 수: {result.frames_scanned}",
                 f"비고: {result.note}",
