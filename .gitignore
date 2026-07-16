@@ -22,3 +22,6 @@ __pycache__/
 
 # 머신별 로컬 설정 (NAS 마운트 경로 등, 컴퓨터마다 다름 - 동기화하면 안 됨)
 .local_settings.json
+
+# 디버그 로그 (계속 커지는 실행 로그, 동기화 대상 아님)
+reports/ksl_validator.log

@@ -17,6 +17,7 @@ GUI에서 실제 프레임을 눈으로 보고 내리는 걸 전제로 한다.
 from __future__ import annotations
 
 import csv
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -28,6 +29,7 @@ from . import sldict_client
 from .compare import combined_similarity
 from .hands import HandPoseExtractor
 from .keyframe_images import find_keyframe_images
+from .logging_setup import log
 from .metadata import DatasetEntry
 from .pose import PoseExtractor
 
@@ -54,8 +56,10 @@ class Extractors:
     """YOLO pose + MediaPipe hands 모델을 한 번만 로드해서 재사용."""
 
     def __init__(self, pose_model: str | Path = None):
+        t0 = time.perf_counter()
         self.pose = PoseExtractor(pose_model) if pose_model else PoseExtractor()
         self.hands = HandPoseExtractor()
+        log.info(f"[pipeline] YOLO+MediaPipe 모델 로딩: {time.perf_counter() - t0:.3f}초")
 
     def signature(self, frame) -> Signature:
         return Signature(body=self.pose.extract(frame), hands=self.hands.extract(frame))
@@ -99,6 +103,7 @@ def extract_my_keyframe_from_nas(
     if not video_path.exists():
         return None, f"NAS 비디오 없음(마운트 확인 필요): {video_path}"
 
+    t0 = time.perf_counter()
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return None, f"비디오를 열 수 없음: {video_path}"
@@ -107,6 +112,7 @@ def extract_my_keyframe_from_nas(
     cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
     ret, frame = cap.read()
     cap.release()
+    log.debug(f"[pipeline] NAS 비디오 프레임 읽기 {video_path.name}#{target_frame}: {time.perf_counter() - t0:.3f}초")
     if not ret:
         return None, f"프레임 {target_frame} 읽기 실패"
 
@@ -124,11 +130,15 @@ def extract_my_keyframe_from_images_dir(
     sldict의 '수형 사진'과 달리 실제 촬영 사진이라 pose 검출이 잘 된다.
     같은 origin_no로 여러 장 있으면 첫 번째(index=1)를 자동 채점에 사용한다.
     """
+    t0 = time.perf_counter()
     matches = find_keyframe_images(keyframe_images_dir, entry.origin_no)
+    log.debug(f"[pipeline] NAS keyframe_images glob origin_no={entry.origin_no}: {time.perf_counter() - t0:.3f}초, {len(matches)}개")
     if not matches:
         return None, f"keyframe_images에 origin_no={entry.origin_no} 사진 없음(NAS 마운트 확인)"
 
+    t0 = time.perf_counter()
     frame = cv2.imread(str(matches[0]))
+    log.debug(f"[pipeline] NAS 이미지 읽기 {matches[0].name}: {time.perf_counter() - t0:.3f}초")
     if frame is None:
         return None, f"이미지를 읽을 수 없음: {matches[0]}"
 
@@ -157,6 +167,7 @@ def scan_video_for_best_match(
     on_frame: (frame_idx, frame_ndarray, current_score_or_None) -> None
     지정하면 스캔한 프레임마다 호출된다 (GUI에서 진행 상황을 실시간으로 보여주는 용도).
     """
+    t0 = time.perf_counter()
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return None, None, False, 0
@@ -184,6 +195,12 @@ def scan_video_for_best_match(
         frame_idx += 1
 
     cap.release()
+    elapsed = time.perf_counter() - t0
+    rate = scanned / elapsed if elapsed > 0 else 0
+    log.info(
+        f"[pipeline] scan_video_for_best_match {Path(video_path).name}: "
+        f"{scanned}프레임 스캔, {elapsed:.3f}초 ({rate:.1f} fps 처리 속도), best_score={best_score}"
+    )
     return best_score, best_idx, best_hand_used, scanned
 
 

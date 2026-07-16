@@ -75,6 +75,7 @@ class MainWindow(QMainWindow):
 
         self.entries: list[DatasetEntry] = []
         self.entry_by_origin: dict[str, DatasetEntry] = {}
+        self._item_by_origin: dict[str, QTableWidgetItem] = {}  # origin_no -> col0 item (O(1) 행 찾기용)
         self.results: dict[str, ValidationResult] = {}
         self.manual_keyframe: dict[str, Path] = {}
         self.dataset_root: Optional[Path] = None
@@ -91,6 +92,7 @@ class MainWindow(QMainWindow):
         self._handshape_thread: Optional[HandshapeFetchThread] = None
         self._my_kf_frames: list[np.ndarray] = []
         self._my_kf_idx = 0
+        self._validating_origin_no: Optional[str] = None
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._on_play_tick)
 
@@ -526,6 +528,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_table(self):
         self.table.setSortingEnabled(False)
+        self._item_by_origin.clear()
         visible = self._visible_entries()
         self.table.setRowCount(len(visible))
         for row, entry in enumerate(visible):
@@ -554,6 +557,11 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem(val)
             item.setBackground(bg)
             self.table.setItem(row, col, item)
+            if col == 0:
+                # origin_no -> item 참조를 저장해두면, 정렬로 행 순서가 바뀌어도
+                # item.row()로 항상 O(1)에 현재 행을 찾을 수 있다 (테이블 전체를
+                # 매번 훑는 건 데이터가 많을 때(수천 개) 눈에 띄게 느려짐)
+                self._item_by_origin[entry.origin_no] = item
 
     def _selected_entry(self) -> Optional[DatasetEntry]:
         rows = self.table.selectionModel().selectedRows()
@@ -605,12 +613,17 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.stop()
 
+    def _row_of(self, origin_no: str) -> Optional[int]:
+        """origin_no의 현재 테이블 행 번호를 O(1)에 찾는다 (정렬돼도 안전).
+        데이터가 수천 개일 때 매번 테이블 전체를 훑으면 눈에 띄게 느려진다."""
+        item = self._item_by_origin.get(origin_no)
+        return item.row() if item is not None else None
+
     def _on_result_ready(self, origin_no: str, result: ValidationResult):
         self.results[origin_no] = result
-        for row in range(self.table.rowCount()):
-            if self.table.item(row, 0).text() == origin_no:
-                self._fill_row(row, self.entry_by_origin[origin_no])
-                break
+        row = self._row_of(origin_no)
+        if row is not None:
+            self._fill_row(row, self.entry_by_origin[origin_no])
         entry = self._selected_entry()
         if entry and entry.origin_no == origin_no:
             self._show_detail_for(entry)
@@ -620,7 +633,10 @@ class MainWindow(QMainWindow):
 
     def _on_frame_progress(self, origin_no: str, frame: np.ndarray, score: Optional[float]):
         """검증 중인 프레임을 실시간으로 보여준다 (YOLO+MediaPipe가 실제로
-        사람을 잡고 있는지 눈으로 바로 확인 가능)."""
+        사람을 잡고 있는지 눈으로 바로 확인 가능). 처리 중인 항목이 바뀌면
+        테이블에서도 그 행을 자동으로 선택/스크롤해서, 상세 패널(내 키프레임/
+        사전 동영상/수형사진)이 지금 검증 중인 글로스를 같이 보여주게 한다.
+        """
         self.live_preview_label.setPixmap(cv2_to_pixmap(frame, size=(160, 120)))
         gloss = self.entry_by_origin.get(origin_no)
         gloss_name = gloss.gloss_name if gloss else ""
@@ -628,6 +644,13 @@ class MainWindow(QMainWindow):
         self.live_preview_text.setText(
             f"검증 중: origin_no={origin_no} ({gloss_name})  |  현재 프레임 유사도: {score_txt}"
         )
+
+        if origin_no != self._validating_origin_no:
+            self._validating_origin_no = origin_no
+            row = self._row_of(origin_no)
+            if row is not None:
+                self.table.selectRow(row)
+                self.table.scrollToItem(self.table.item(row, 0))
 
     def _on_validation_finished(self):
         self.btn_validate_all.setEnabled(True)
@@ -951,10 +974,9 @@ class MainWindow(QMainWindow):
         self._show_detail_for(entry)
 
     def _fill_row_by_origin(self, origin_no: str):
-        for row in range(self.table.rowCount()):
-            if self.table.item(row, 0).text() == origin_no:
-                self._fill_row(row, self.entry_by_origin[origin_no])
-                break
+        row = self._row_of(origin_no)
+        if row is not None:
+            self._fill_row(row, self.entry_by_origin[origin_no])
 
     def _append_review_log(self, entry: DatasetEntry, decision: str):
         result = self.results.get(entry.origin_no)

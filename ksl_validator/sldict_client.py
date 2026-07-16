@@ -9,11 +9,14 @@ POST /front/sign/include/controlVideoSpeed.do 로 AJAX 요청을 보내
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
+
+from .logging_setup import log
 
 BASE_URL = "https://sldict.korean.go.kr"
 VIDEO_AJAX_PATH = "/front/sign/include/controlVideoSpeed.do"
@@ -53,10 +56,12 @@ def fetch_video(session: requests.Session, origin_no: str, category: str = "") -
         "refOriginNo": "0",
         "ref_category": "",
     }
+    t0 = time.perf_counter()
     resp = session.post(
         f"{BASE_URL}{VIDEO_AJAX_PATH}", data=form_data, headers=HEADERS, timeout=15
     )
     resp.raise_for_status()
+    log.debug(f"[sldict] fetch_video origin_no={origin_no}: {time.perf_counter() - t0:.3f}초")
 
     soup = BeautifulSoup(resp.text, "html.parser")
     sources = {}
@@ -89,15 +94,21 @@ def download_video(
     dest_path = dest_dir / f"{video.origin_no}.mp4"
 
     if dest_path.exists() and not overwrite:
+        log.debug(f"[sldict] {video.origin_no}.mp4 이미 캐시됨 - 다운로드 생략")
         return dest_path
 
+    t0 = time.perf_counter()
     resp = session.get(video.mp4_url, headers=HEADERS, stream=True, timeout=30)
     resp.raise_for_status()
     tmp_path = dest_path.with_suffix(".mp4.part")
+    size = 0
     with open(tmp_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
+            size += len(chunk)
     tmp_path.rename(dest_path)
+    elapsed = time.perf_counter() - t0
+    log.info(f"[sldict] {video.origin_no}.mp4 다운로드 완료: {size/1024:.0f}KB, {elapsed:.3f}초")
     return dest_path
 
 
@@ -120,11 +131,13 @@ def fetch_handshape_image_urls(session: requests.Session, origin_no: str) -> lis
     MediaPipe/YOLO로는 검출이 잘 안 되므로 자동 채점에는 쓰지 말고,
     사람이 눈으로 참고하는 용도로만 사용한다.
     """
+    t0 = time.perf_counter()
     resp = session.get(
         f"{BASE_URL}{CONTENT_VIEW_PATH}", params={"origin_no": origin_no},
         headers=HEADERS, timeout=15,
     )
     resp.raise_for_status()
+    log.debug(f"[sldict] fetch_handshape_image_urls origin_no={origin_no}: {time.perf_counter() - t0:.3f}초")
 
     soup = BeautifulSoup(resp.text, "html.parser")
     urls: list[str] = []

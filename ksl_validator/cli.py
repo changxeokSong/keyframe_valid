@@ -31,6 +31,7 @@ from .pipeline import (
     extract_keyframe_from_image,
 )
 from . import sldict_client
+from .logging_setup import LOG_PATH, setup_logging
 from .paths import VALIDATION_REPORT_PATH, VIDEOS_CACHE_DIR
 
 DEFAULT_CACHE_DIR = VIDEOS_CACHE_DIR
@@ -134,6 +135,8 @@ def cmd_gui(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
+    log = setup_logging()  # main()에서 이미 호출되지만 cmd_gui 단독 호출 대비 안전하게 한 번 더
+    log.info(f"GUI 시작 (로그 파일: {LOG_PATH})")
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
@@ -181,6 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    setup_logging()
     parser = build_parser()
     args = parser.parse_args(argv)
     args.func(args)
