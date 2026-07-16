@@ -5,9 +5,21 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import torch
 from ultralytics import YOLO
 
+from .logging_setup import log
+
 DEFAULT_MODEL_PATH = Path(__file__).parent / "models" / "yolo11n-pose.pt"
+
+
+def select_device() -> str:
+    """CUDA(NVIDIA) 있으면 그걸, 없으면 MPS(Apple Silicon), 그것도 없으면 CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 # COCO 17-keypoint pose. 얼굴 점(0-4)은 수어 판별에 거의 도움이 안 되므로
 # 상체/팔/손목 위주(5-10)에 가중치를 더 준다. (손가락 관절까지는 커버 못 함 — 한계점)
@@ -26,6 +38,8 @@ KEYPOINT_WEIGHTS = np.array(
 class PoseExtractor:
     def __init__(self, model_name: str | Path = DEFAULT_MODEL_PATH):
         self.model = YOLO(str(model_name))
+        self.device = select_device()
+        log.info(f"[pose] YOLO 추론 디바이스: {self.device}")
 
     def extract(self, frame: np.ndarray) -> np.ndarray | None:
         """frame(BGR ndarray)에서 가장 confidence 높은 사람의 keypoint를 반환.
@@ -33,7 +47,7 @@ class PoseExtractor:
         반환값: (17, 3) ndarray [x, y, conf] (정규화 전, 원본 픽셀 좌표) 또는
         사람이 검출되지 않으면 None.
         """
-        results = self.model(frame, verbose=False)
+        results = self.model(frame, verbose=False, device=self.device)
         if not results:
             return None
         r = results[0]

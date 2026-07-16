@@ -9,6 +9,7 @@ import requests
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from .. import sldict_client
+from ..keyframe_images import load_keyframe_candidates
 from ..metadata import DatasetEntry
 from ..pipeline import Extractors, ValidationResult, validate_entry
 
@@ -97,3 +98,49 @@ class HandshapeFetchThread(QThread):
             self.fetched.emit(self.origin_no, paths)
         except Exception as e:  # noqa: BLE001 - 오프라인/사이트 오류는 조용히 실패 처리
             self.failed.emit(self.origin_no, str(e))
+
+
+class KeyframeLoadThread(QThread):
+    """'검토 대상 키프레임'과 '정답 기준 이미지'를 NAS에서 읽어오는 동안
+    UI가 멈추지 않도록 백그라운드에서 처리한다.
+
+    NAS 네트워크 지연이 항목당 4~5초씩 걸리는 게 직접 확인됐는데, 이걸
+    GUI 메인 스레드에서 그대로 하면 행을 클릭할 때마다 그만큼 전체 화면이
+    멈춘다. 그래서 분리했다.
+    """
+
+    finished_loading = pyqtSignal(str, list, str, list, list)
+    # origin_no, my_kf_frames, gloss_name, ref_kf_frames, ref_kf_sources
+
+    def __init__(
+        self,
+        entry: DatasetEntry,
+        ref_entries: list[DatasetEntry],
+        keyframe_images_dir,
+        dataset_root,
+        manual_override,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.entry = entry
+        self.ref_entries = ref_entries
+        self.keyframe_images_dir = keyframe_images_dir
+        self.dataset_root = dataset_root
+        self.manual_override = manual_override
+
+    def run(self):
+        my_frames = load_keyframe_candidates(
+            self.entry, self.keyframe_images_dir, self.dataset_root, self.manual_override
+        )
+
+        ref_frames = []
+        ref_sources = []
+        for e in self.ref_entries[:5]:
+            candidates = load_keyframe_candidates(e, self.keyframe_images_dir, self.dataset_root, None)
+            if candidates:
+                ref_frames.append(candidates[0])
+                ref_sources.append(f"출처: origin_no={e.origin_no} ({e.gloss_name})")
+
+        self.finished_loading.emit(
+            self.entry.origin_no, my_frames, self.entry.gloss_name, ref_frames, ref_sources
+        )

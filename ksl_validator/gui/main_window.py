@@ -28,14 +28,15 @@ from PyQt5.QtWidgets import (
 from .. import local_settings
 from ..dataset_config import DEFAULT_CONFIG_PATH, load_dataset_config
 from ..exception_store import DEFAULT_STAGING_DIR, ExceptionStore
-from ..keyframe_images import find_keyframe_images
 from ..logging_setup import log, log_time
 from ..metadata import DatasetEntry, load_dataset
 from ..paths import HANDSHAPE_CACHE_DIR, REVIEW_LOG_PATH, SAMPLE_EXCEPTION_CSV_PATH, VIDEOS_CACHE_DIR
 from ..pipeline import ValidationResult
+from ..compare import combined_similarity
+from ..pipeline import Extractors
 from ..report import build_report, DEFAULT_REPORT_MD_PATH
 from ..user_info import safe_getuser
-from .worker import HandshapeFetchThread, ValidationWorker
+from .worker import HandshapeFetchThread, KeyframeLoadThread, ValidationWorker
 
 IMG_W, IMG_H = 320, 240
 DEFAULT_CACHE_DIR = VIDEOS_CACHE_DIR
@@ -94,9 +95,12 @@ class MainWindow(QMainWindow):
         self._handshape_cache: dict[str, list[Path]] = {}  # origin_no -> paths (빈 리스트 = 확인함, 없음)
         self._handshape_thread: Optional[HandshapeFetchThread] = None
         self._my_kf_frames: list[np.ndarray] = []
+        self._my_kf_cache: dict[str, list] = {}  # origin_no -> frames, NAS 재읽기 방지
         self._ref_kf_frames: list[np.ndarray] = []
         self._ref_kf_sources: list[str] = []
         self._ref_kf_cache: dict[str, tuple] = {}  # gloss_name -> (frames, sources), NAS 재읽기 방지
+        self._kf_thread: Optional[KeyframeLoadThread] = None
+        self._extractors: Optional[Extractors] = None  # 지연 로딩 (첫 비교 때 한 번만 모델 로드)
         self._validating_origin_no: Optional[str] = None
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._on_play_tick)
@@ -292,7 +296,7 @@ class MainWindow(QMainWindow):
 
         # 정답 기준 이미지 (같은 글로스의 다른 정상(비예외) 영상 키프레임)
         ref_ex_box, self.ref_kf_label, self.ref_kf_slider, self.ref_kf_idx_label = self._build_slider_panel(
-            "정답 기준 이미지 (같은 글로스의 다른 정상 영상)", self._on_ref_kf_slider_moved
+            "정답 키프레임 (같은 글로스의 다른 정상 영상)", self._on_ref_kf_slider_moved
         )
         self.ref_kf_source_label = QLabel("")
         self.ref_kf_source_label.setWordWrap(True)
@@ -528,6 +532,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "키프레임 이미지 선택", "", "Images (*.jpg *.jpeg *.png)")
         if path:
             self.manual_keyframe[entry.origin_no] = Path(path)
+            self._my_kf_cache.pop(entry.origin_no, None)  # 캐시된 값 대신 새로 지정한 이미지를 쓰게
             self._show_detail_for(entry)
 
     def _index_entries(self):
@@ -539,6 +544,7 @@ class MainWindow(QMainWindow):
         for e in self.entries:
             self._entries_by_gloss.setdefault(e.gloss_name, []).append(e)
         self._ref_kf_cache.clear()
+        self._my_kf_cache.clear()
 
     # ── 테이블 ─────────────────────────────────────────────────────────
     def _visible_entries(self) -> list[DatasetEntry]:
@@ -699,31 +705,40 @@ class MainWindow(QMainWindow):
         result = self.results.get(entry.origin_no)
         is_exc = self.exception_store.is_exception(entry.origin_no) if self.exception_store else False
 
-        # 내 키프레임 표시 (여러 개면 슬라이더로 넘겨볼 수 있음)
-        t0 = time.perf_counter()
-        self._my_kf_frames = self._load_my_keyframe_candidates(entry)
-        log.debug(f"[gui]   내 키프레임 로드: {time.perf_counter() - t0:.3f}초, {len(self._my_kf_frames)}장")
-        self._set_slider_frames(self.my_kf_slider, self.my_kf_label, self.my_kf_idx_label,
-                                 self._my_kf_frames, "(키프레임 없음 - NAS 미마운트\n또는 직접 지정 필요)")
+        # 내 키프레임 + 기준 이미지 표시. NAS 읽기가 항목당 4~5초씩 걸리는 게
+        # 확인돼서, 캐시에 없으면 메인 스레드를 막지 않게 백그라운드로 돌린다.
+        origin_no = entry.origin_no
+        my_cached = self._my_kf_cache.get(origin_no)
+        ref_cached = self._ref_kf_cache.get(entry.gloss_name)
 
-        # 기준 이미지 표시 (같은 글로스의 다른 정상(비예외) 영상 키프레임)
-        # gloss_name 단위로 캐싱 - 같은 글로스를 다시 보면 NAS를 또 안 읽음
-        t0 = time.perf_counter()
-        if entry.gloss_name in self._ref_kf_cache:
-            self._ref_kf_frames, ref_sources = self._ref_kf_cache[entry.gloss_name]
-            log.debug(f"[gui]   기준 이미지: 캐시 사용, {time.perf_counter() - t0:.3f}초")
+        if my_cached is not None:
+            self._my_kf_frames = my_cached
+            self._set_slider_frames(self.my_kf_slider, self.my_kf_label, self.my_kf_idx_label,
+                                     self._my_kf_frames, "(키프레임 없음 - NAS 미마운트\n또는 직접 지정 필요)")
+            log.debug(f"[gui]   내 키프레임: 캐시 사용, {len(self._my_kf_frames)}장")
         else:
+            self.my_kf_label.setText("(불러오는 중... NAS 읽기라 몇 초 걸릴 수 있음)")
+            self.my_kf_slider.setRange(0, 0)
+            self.my_kf_idx_label.setText("- / -")
+
+        if ref_cached is not None:
+            self._ref_kf_frames, ref_sources = ref_cached
+            self._ref_kf_sources = ref_sources
+            self._set_slider_frames(self.ref_kf_slider, self.ref_kf_label, self.ref_kf_idx_label,
+                                     self._ref_kf_frames, "(같은 글로스의 다른 정상 영상을 못 찾음)")
+            self.ref_kf_source_label.setText(ref_sources[0] if ref_sources else "")
+            log.debug(f"[gui]   기준 이미지: 캐시 사용, {len(self._ref_kf_frames)}장")
+
+        if my_cached is None or ref_cached is None:
+            if self._kf_thread is not None and self._kf_thread.isRunning():
+                self._kf_thread.wait(0)  # 이전 요청은 그냥 흘려보냄(콜백에서 origin_no로 걸러짐)
             ref_entries = self._find_reference_entries(entry)
-            self._ref_kf_frames, ref_sources = self._load_reference_keyframes(ref_entries)
-            self._ref_kf_cache[entry.gloss_name] = (self._ref_kf_frames, ref_sources)
-            log.debug(
-                f"[gui]   기준 이미지: 새로 로드, {time.perf_counter() - t0:.3f}초, "
-                f"후보 {len(ref_entries)}개 중 {len(self._ref_kf_frames)}장 성공"
+            manual_override = self.manual_keyframe.get(origin_no)
+            self._kf_thread = KeyframeLoadThread(
+                entry, ref_entries, self.keyframe_images_dir, self.dataset_root, manual_override
             )
-        self._ref_kf_sources = ref_sources
-        self._set_slider_frames(self.ref_kf_slider, self.ref_kf_label, self.ref_kf_idx_label,
-                                 self._ref_kf_frames, "(같은 글로스의 다른 정상 영상을 못 찾음)")
-        self.ref_kf_source_label.setText(ref_sources[0] if ref_sources else "")
+            self._kf_thread.finished_loading.connect(self._on_keyframe_loaded)
+            self._kf_thread.start()
 
         # 사전 사이트 프레임 표시 + 슬라이더 세팅
         t0 = time.perf_counter()
@@ -780,53 +795,27 @@ class MainWindow(QMainWindow):
         self.btn_restore.setEnabled(is_exc)
         self.btn_mark_exception.setEnabled(not is_exc)
 
-    def _load_my_keyframe_candidates(self, entry: DatasetEntry) -> list[np.ndarray]:
-        """'내 키프레임'으로 볼 수 있는 프레임들을 전부 모아서 반환 (여러 개면
-        이전/다음 버튼으로 넘겨볼 수 있게). 우선순위:
-        수동 지정 이미지 > NAS keyframe_images 실제 사진(여러 장 가능) >
-        NAS 원본 비디오의 태깅된 키프레임 인덱스들(여러 개 가능)
-        (자동 채점 pipeline.validate_entry는 이 중 첫 번째만 쓴다 - 화면은 전체를 보여줌)
-        """
-        override = self.manual_keyframe.get(entry.origin_no)
-        if override is not None:
-            frame = cv2.imread(str(override))
-            if frame is not None:
-                return [frame]
+    def _on_keyframe_loaded(self, origin_no: str, my_frames: list, gloss_name: str,
+                             ref_frames: list, ref_sources: list):
+        """KeyframeLoadThread가 NAS에서 다 읽어온 뒤 호출됨. 캐시에 저장해두고,
+        지금도 그 행/글로스를 보고 있으면 화면을 갱신한다(그 사이 다른 행을
+        클릭했으면 화면은 안 건드리고 캐시만 채워둠)."""
+        self._my_kf_cache[origin_no] = my_frames
+        self._ref_kf_cache[gloss_name] = (ref_frames, ref_sources)
 
-        if self.keyframe_images_dir is not None:
-            t0 = time.perf_counter()
-            matches = find_keyframe_images(self.keyframe_images_dir, entry.origin_no)
-            frames = []
-            for m in matches:
-                frame = cv2.imread(str(m))
-                if frame is not None:
-                    frames.append(frame)
-            log.debug(
-                f"[gui]     NAS keyframe_images 읽기 origin_no={entry.origin_no}: "
-                f"{time.perf_counter() - t0:.3f}초, {len(frames)}장"
-            )
-            if frames:
-                return frames
-
-        if self.dataset_root is not None and entry.video_rel_path and entry.keyframes:
-            video_path = self.dataset_root / entry.video_rel_path
-            if video_path.exists():
-                t0 = time.perf_counter()
-                cap = cv2.VideoCapture(str(video_path))
-                frames = []
-                for kf_idx in entry.keyframes:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, kf_idx)
-                    ret, frame = cap.read()
-                    if ret:
-                        frames.append(frame)
-                cap.release()
-                log.debug(
-                    f"[gui]     NAS 원본 비디오 프레임 읽기 {video_path.name}: "
-                    f"{time.perf_counter() - t0:.3f}초, {len(frames)}장"
-                )
-                if frames:
-                    return frames
-        return []
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        if entry.origin_no == origin_no:
+            self._my_kf_frames = my_frames
+            self._set_slider_frames(self.my_kf_slider, self.my_kf_label, self.my_kf_idx_label,
+                                     my_frames, "(키프레임 없음 - NAS 미마운트\n또는 직접 지정 필요)")
+        if entry.gloss_name == gloss_name:
+            self._ref_kf_frames = ref_frames
+            self._ref_kf_sources = ref_sources
+            self._set_slider_frames(self.ref_kf_slider, self.ref_kf_label, self.ref_kf_idx_label,
+                                     ref_frames, "(같은 글로스의 다른 정상 영상을 못 찾음)")
+            self.ref_kf_source_label.setText(ref_sources[0] if ref_sources else "")
 
     def _set_slider_frames(self, slider: QSlider, img_label: QLabel, idx_label: QLabel,
                             frames: list, empty_text: str):
@@ -860,18 +849,6 @@ class MainWindow(QMainWindow):
             if normal:
                 return normal
         return others
-
-    def _load_reference_keyframes(self, ref_entries: list[DatasetEntry]) -> tuple[list, list[str]]:
-        """기준 항목들의 키프레임(항목당 첫 장)을 모아서 (frames, 출처설명) 반환.
-        너무 많으면 느려지므로 상위 5개까지만 본다."""
-        frames = []
-        sources = []
-        for e in ref_entries[:5]:
-            candidates = self._load_my_keyframe_candidates(e)
-            if candidates:
-                frames.append(candidates[0])
-                sources.append(f"출처: origin_no={e.origin_no} ({e.gloss_name})")
-        return frames, sources
 
     def _on_ref_kf_slider_moved(self, idx: int):
         if not self._ref_kf_frames:
@@ -1117,4 +1094,6 @@ class MainWindow(QMainWindow):
             self.worker.wait(2000)
         if self._handshape_thread and self._handshape_thread.isRunning():
             self._handshape_thread.wait(2000)
+        if self._kf_thread and self._kf_thread.isRunning():
+            self._kf_thread.wait(2000)
         super().closeEvent(event)
