@@ -67,10 +67,15 @@ def _row_key(origin_no: str, video_id: str) -> str:
 
 def _row_matches(row: "ExceptionRow", video_id: str) -> bool:
     """이 예외행이 조회하려는 특정 사람(video_id)의 것인지 판단.
-    저장된 행에 video_id가 없거나(구버전/글로스 단위 등록) 조회 쪽이 video_id를
-    모르면(예: 예전 호출부) origin_no만으로 폭넓게 매칭 - 있으면 정확히 같을 때만."""
-    if not row.video_id or row.video_id.startswith("(video_id 불명") or not video_id:
+    저장된 행에 video_id가 없으면(구버전/글로스 단위 등록) origin_no만으로 폭넓게
+    매칭한다. 하지만 반대로 "조회하는 쪽"에 video_id가 없다고 아무 행에나 걸리게
+    하면 안 된다 - 그러면 video_id가 있는 다른 사람의 예외 기록이 video_id 없는
+    행(사람 구분 정보가 없는 데이터)에 전부 엉뚱하게 매칭되는 버그가 있었다
+    (직접 확인: 예외처리 안 한 형제 행들이 전부 '예외'로 잘못 표시됨)."""
+    if not row.video_id or row.video_id.startswith("(video_id 불명"):
         return True
+    if not video_id:
+        return False
     return row.video_id.strip() == video_id.strip()
 
 
