@@ -75,6 +75,7 @@ class MainWindow(QMainWindow):
 
         self.entries: list[DatasetEntry] = []
         self.entry_by_origin: dict[str, DatasetEntry] = {}
+        self._entries_by_gloss: dict[str, list[DatasetEntry]] = {}  # gloss_name -> entries (기준 이미지 찾기용)
         self._item_by_origin: dict[str, QTableWidgetItem] = {}  # origin_no -> col0 item (O(1) 행 찾기용)
         self.results: dict[str, ValidationResult] = {}
         self.manual_keyframe: dict[str, Path] = {}
@@ -87,11 +88,13 @@ class MainWindow(QMainWindow):
         self._current_video_cap: Optional[cv2.VideoCapture] = None
         self._current_video_total = 0
         self._handshape_paths: list[Path] = []
-        self._handshape_idx = 0
+        self._handshape_frames: list[np.ndarray] = []
         self._handshape_cache: dict[str, list[Path]] = {}  # origin_no -> paths (빈 리스트 = 확인함, 없음)
         self._handshape_thread: Optional[HandshapeFetchThread] = None
         self._my_kf_frames: list[np.ndarray] = []
-        self._my_kf_idx = 0
+        self._ref_kf_frames: list[np.ndarray] = []
+        self._ref_kf_sources: list[str] = []
+        self._ref_kf_cache: dict[str, tuple] = {}  # gloss_name -> (frames, sources), NAS 재읽기 방지
         self._validating_origin_no: Optional[str] = None
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._on_play_tick)
@@ -244,55 +247,66 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_row_selected)
         return self.table
 
+    def _build_slider_panel(self, title: str, on_slide) -> tuple[QVBoxLayout, QLabel, QSlider, QLabel]:
+        """이미지/프레임이 여러 개일 수 있는 패널의 공통 뼈대.
+        내 키프레임 / 기준 이미지 / 사전 동영상 / 수형사진 전부 이 슬라이더
+        패턴 하나로 통일한다 (일관된 조작감).
+        """
+        box = QVBoxLayout()
+        box.addWidget(QLabel(f"<b>{title}</b>"))
+
+        img_label = QLabel()
+        img_label.setFixedSize(IMG_W, IMG_H)
+        img_label.setStyleSheet("background:#eee; border:1px solid #ccc;")
+        img_label.setAlignment(Qt.AlignCenter)
+        img_label.setWordWrap(True)
+        box.addWidget(img_label)
+
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(0, 0)
+        slider.valueChanged.connect(on_slide)
+        box.addWidget(slider)
+
+        idx_label = QLabel("- / -")
+        box.addWidget(idx_label)
+
+        return box, img_label, slider, idx_label
+
     def _build_detail_panel(self) -> QWidget:
         panel = QWidget()
         layout = QHBoxLayout(panel)
 
-        # 내 키프레임
-        left_box = QVBoxLayout()
-        left_box.addWidget(QLabel("<b>내 키프레임</b>"))
-        self.my_kf_label = QLabel()
-        self.my_kf_label.setFixedSize(IMG_W, IMG_H)
-        self.my_kf_label.setStyleSheet("background:#eee; border:1px solid #ccc;")
-        self.my_kf_label.setAlignment(Qt.AlignCenter)
-        left_box.addWidget(self.my_kf_label)
-        self.my_kf_idx_label = QLabel("키프레임: -")
-        left_box.addWidget(self.my_kf_idx_label)
-        my_kf_nav = QHBoxLayout()
-        btn_my_kf_prev = QPushButton("◀ 이전 키프레임")
-        btn_my_kf_prev.clicked.connect(lambda: self._show_my_keyframe_at(self._my_kf_idx - 1))
-        my_kf_nav.addWidget(btn_my_kf_prev)
-        btn_my_kf_next = QPushButton("다음 키프레임 ▶")
-        btn_my_kf_next.clicked.connect(lambda: self._show_my_keyframe_at(self._my_kf_idx + 1))
-        my_kf_nav.addWidget(btn_my_kf_next)
-        left_box.addLayout(my_kf_nav)
+        # 내 키프레임 (지금 선택된 항목이 태깅된 그 키프레임 - "정답"으로 삼는 기준)
+        left_box, self.my_kf_label, self.my_kf_slider, self.my_kf_idx_label = self._build_slider_panel(
+            "내 키프레임", self._on_my_kf_slider_moved
+        )
         btn_manual_kf = QPushButton("키프레임 이미지 직접 지정...")
         btn_manual_kf.clicked.connect(self._pick_manual_keyframe)
         left_box.addWidget(btn_manual_kf)
         left_box.addStretch()
         layout.addLayout(left_box)
 
-        # 사전 사이트 프레임 (스크러버)
-        mid_box = QVBoxLayout()
-        mid_box.addWidget(QLabel("<b>사전 사이트 동영상 (최고매칭 프레임으로 이동됨)</b>"))
-        self.site_frame_label = QLabel()
-        self.site_frame_label.setFixedSize(IMG_W, IMG_H)
-        self.site_frame_label.setStyleSheet("background:#eee; border:1px solid #ccc;")
-        self.site_frame_label.setAlignment(Qt.AlignCenter)
-        mid_box.addWidget(self.site_frame_label)
-        self.frame_slider = QSlider(Qt.Horizontal)
-        self.frame_slider.valueChanged.connect(self._on_slider_moved)
-        mid_box.addWidget(self.frame_slider)
-        self.frame_idx_label = QLabel("프레임: -")
-        mid_box.addWidget(self.frame_idx_label)
+        # 기준 이미지 (같은 글로스의 다른 정상(비예외) 영상 키프레임 - 진짜 정답 예시)
+        ref_ex_box, self.ref_kf_label, self.ref_kf_slider, self.ref_kf_idx_label = self._build_slider_panel(
+            "기준 이미지 (같은 글로스의 다른 정상 영상)", self._on_ref_kf_slider_moved
+        )
+        self.ref_kf_source_label = QLabel("")
+        self.ref_kf_source_label.setWordWrap(True)
+        self.ref_kf_source_label.setStyleSheet("color:#666;")
+        ref_ex_box.addWidget(self.ref_kf_source_label)
+        ref_ex_box.addStretch()
+        layout.addLayout(ref_ex_box)
 
+        # 사전 사이트 동영상 (최고매칭 프레임 - 재생도 가능)
+        mid_box, self.site_frame_label, self.frame_slider, self.frame_idx_label = self._build_slider_panel(
+            "사전 사이트 동영상 (최고매칭 프레임으로 이동됨)", self._on_slider_moved
+        )
         play_row = QHBoxLayout()
         self.btn_play = QPushButton("▶ 재생")
         self.btn_play.clicked.connect(self._toggle_play)
         self.btn_play.setEnabled(False)
         play_row.addWidget(self.btn_play)
         mid_box.addLayout(play_row)
-
         btn_open_site = QPushButton("사전 사이트에서 직접 열기")
         btn_open_site.clicked.connect(self._open_in_browser)
         mid_box.addWidget(btn_open_site)
@@ -300,17 +314,9 @@ class MainWindow(QMainWindow):
         layout.addLayout(mid_box)
 
         # 사전 공식 참고 이미지 (수형사진 - 일러스트, 사람 눈으로 참고용)
-        ref_box = QVBoxLayout()
-        ref_box.addWidget(QLabel("<b>사전 공식 참고(수형사진, 일러스트)</b>"))
-        self.handshape_label = QLabel()
-        self.handshape_label.setFixedSize(IMG_W, IMG_H)
-        self.handshape_label.setStyleSheet("background:#eee; border:1px solid #ccc;")
-        self.handshape_label.setAlignment(Qt.AlignCenter)
-        self.handshape_label.setWordWrap(True)
-        ref_box.addWidget(self.handshape_label)
-        btn_next_handshape = QPushButton("다음 이미지")
-        btn_next_handshape.clicked.connect(self._show_next_handshape)
-        ref_box.addWidget(btn_next_handshape)
+        ref_box, self.handshape_label, self.handshape_slider, self.handshape_idx_label = self._build_slider_panel(
+            "사전 공식 참고(수형사진, 일러스트)", self._on_handshape_slider_moved
+        )
         ref_box.addStretch()
         layout.addLayout(ref_box)
 
@@ -348,7 +354,7 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "오류", f"메타데이터 로드 실패:\n{e}")
             return
-        self.entry_by_origin = {e.origin_no: e for e in self.entries}
+        self._index_entries()
         self.meta_label.setText(f"{Path(path).name} ({len(self.entries)}개 항목)")
         self._refresh_table()
         local_settings.update(metadata_path=path)
@@ -430,7 +436,7 @@ class MainWindow(QMainWindow):
             if p.exists():
                 try:
                     self.entries = load_dataset(p)
-                    self.entry_by_origin = {e.origin_no: e for e in self.entries}
+                    self._index_entries()
                     self.meta_label.setText(f"{p.name} ({len(self.entries)}개 항목, 이전 설정 기억)")
                     self._refresh_table()
                 except Exception:  # noqa: BLE001
@@ -479,7 +485,7 @@ class MainWindow(QMainWindow):
             if meta_candidate is not None:
                 try:
                     self.entries = load_dataset(meta_candidate)
-                    self.entry_by_origin = {e.origin_no: e for e in self.entries}
+                    self._index_entries()
                     self.meta_label.setText(f"{meta_candidate.name} ({len(self.entries)}개 항목, 자동)")
                     self._refresh_table()
                     local_settings.update(metadata_path=str(meta_candidate))
@@ -519,6 +525,16 @@ class MainWindow(QMainWindow):
         if path:
             self.manual_keyframe[entry.origin_no] = Path(path)
             self._show_detail_for(entry)
+
+    def _index_entries(self):
+        """entries가 새로 로드될 때 한 번만 인덱싱해둔다. origin_no 조회와
+        같은 gloss_name 찾기(기준 이미지용)를 매번 전체 스캔하면 데이터가
+        많을 때(수천 개) 느려지므로, 여기서 미리 dict로 묶어둔다."""
+        self.entry_by_origin = {e.origin_no: e for e in self.entries}
+        self._entries_by_gloss: dict[str, list[DatasetEntry]] = {}
+        for e in self.entries:
+            self._entries_by_gloss.setdefault(e.gloss_name, []).append(e)
+        self._ref_kf_cache.clear()
 
     # ── 테이블 ─────────────────────────────────────────────────────────
     def _visible_entries(self) -> list[DatasetEntry]:
@@ -677,14 +693,23 @@ class MainWindow(QMainWindow):
         result = self.results.get(entry.origin_no)
         is_exc = self.exception_store.is_exception(entry.origin_no) if self.exception_store else False
 
-        # 내 키프레임 표시 (여러 개면 이전/다음으로 넘겨볼 수 있음)
+        # 내 키프레임 표시 (여러 개면 슬라이더로 넘겨볼 수 있음)
         self._my_kf_frames = self._load_my_keyframe_candidates(entry)
-        self._my_kf_idx = 0
-        if self._my_kf_frames:
-            self._show_my_keyframe_at(0)
+        self._set_slider_frames(self.my_kf_slider, self.my_kf_label, self.my_kf_idx_label,
+                                 self._my_kf_frames, "(키프레임 없음 - NAS 미마운트\n또는 직접 지정 필요)")
+
+        # 기준 이미지 표시 (같은 글로스의 다른 정상(비예외) 영상 키프레임)
+        # gloss_name 단위로 캐싱 - 같은 글로스를 다시 보면 NAS를 또 안 읽음
+        if entry.gloss_name in self._ref_kf_cache:
+            self._ref_kf_frames, ref_sources = self._ref_kf_cache[entry.gloss_name]
         else:
-            self.my_kf_label.setText("(키프레임 없음 - NAS 미마운트\n또는 직접 지정 필요)")
-            self.my_kf_idx_label.setText("키프레임: -")
+            ref_entries = self._find_reference_entries(entry)
+            self._ref_kf_frames, ref_sources = self._load_reference_keyframes(ref_entries)
+            self._ref_kf_cache[entry.gloss_name] = (self._ref_kf_frames, ref_sources)
+        self._ref_kf_sources = ref_sources
+        self._set_slider_frames(self.ref_kf_slider, self.ref_kf_label, self.ref_kf_idx_label,
+                                 self._ref_kf_frames, "(같은 글로스의 다른 정상 영상을 못 찾음)")
+        self.ref_kf_source_label.setText(ref_sources[0] if ref_sources else "")
 
         # 사전 사이트 프레임 표시 + 슬라이더 세팅
         if result and result.video_path and Path(result.video_path).exists():
@@ -776,13 +801,58 @@ class MainWindow(QMainWindow):
                     return frames
         return []
 
-    def _show_my_keyframe_at(self, idx: int):
+    def _set_slider_frames(self, slider: QSlider, img_label: QLabel, idx_label: QLabel,
+                            frames: list, empty_text: str):
+        """내 키프레임/기준 이미지/수형사진 패널 공통: frames 리스트를 슬라이더에 연결하고
+        첫 프레임을 보여준다. 전부 이 패턴 하나로 통일해서 조작감을 동일하게 맞춘다."""
+        slider.blockSignals(True)
+        slider.setRange(0, max(0, len(frames) - 1))
+        slider.setValue(0)
+        slider.blockSignals(False)
+        if frames:
+            img_label.setPixmap(cv2_to_pixmap(frames[0]))
+            idx_label.setText(f"1 / {len(frames)}")
+        else:
+            img_label.setText(empty_text)
+            idx_label.setText("- / -")
+
+    def _on_my_kf_slider_moved(self, idx: int):
         if not self._my_kf_frames:
             return
-        idx = idx % len(self._my_kf_frames)
-        self._my_kf_idx = idx
         self.my_kf_label.setPixmap(cv2_to_pixmap(self._my_kf_frames[idx]))
-        self.my_kf_idx_label.setText(f"키프레임: {idx + 1}/{len(self._my_kf_frames)}")
+        self.my_kf_idx_label.setText(f"{idx + 1} / {len(self._my_kf_frames)}")
+
+    def _find_reference_entries(self, entry: DatasetEntry) -> list[DatasetEntry]:
+        """같은 gloss_name을 가진 다른 항목들 - "정답" 예시로 쓸 후보.
+        예외처리 안 된(정상) 항목을 우선한다. 정상이 하나도 없으면 예외 항목이라도 보여준다.
+        미리 만들어둔 gloss_name 인덱스를 쓰므로 전체 항목을 다시 훑지 않는다."""
+        same_gloss = self._entries_by_gloss.get(entry.gloss_name, [])
+        others = [e for e in same_gloss if e.origin_no != entry.origin_no]
+        if self.exception_store is not None:
+            normal = [e for e in others if not self.exception_store.is_exception(e.origin_no)]
+            if normal:
+                return normal
+        return others
+
+    def _load_reference_keyframes(self, ref_entries: list[DatasetEntry]) -> tuple[list, list[str]]:
+        """기준 항목들의 키프레임(항목당 첫 장)을 모아서 (frames, 출처설명) 반환.
+        너무 많으면 느려지므로 상위 5개까지만 본다."""
+        frames = []
+        sources = []
+        for e in ref_entries[:5]:
+            candidates = self._load_my_keyframe_candidates(e)
+            if candidates:
+                frames.append(candidates[0])
+                sources.append(f"출처: origin_no={e.origin_no} ({e.gloss_name})")
+        return frames, sources
+
+    def _on_ref_kf_slider_moved(self, idx: int):
+        if not self._ref_kf_frames:
+            return
+        self.ref_kf_label.setPixmap(cv2_to_pixmap(self._ref_kf_frames[idx]))
+        self.ref_kf_idx_label.setText(f"{idx + 1} / {len(self._ref_kf_frames)}")
+        if idx < len(self._ref_kf_sources):
+            self.ref_kf_source_label.setText(self._ref_kf_sources[idx])
 
     def _load_handshape_images(self, entry: DatasetEntry):
         """사전 사이트의 '수형 사진'(일러스트) 로드. 참고용이며 자동 채점엔 안 씀.
@@ -792,7 +862,7 @@ class MainWindow(QMainWindow):
         순서로 확인한다. UI 스레드를 절대 막지 않는다.
         """
         self._handshape_paths = []
-        self._handshape_idx = 0
+        self._handshape_frames = []
         origin_no = entry.origin_no
 
         # 1) 메모리 캐시 (이미 이번 세션에 한 번이라도 확인했으면 즉시 표시)
@@ -839,26 +909,20 @@ class MainWindow(QMainWindow):
         self.handshape_label.setPixmap(QPixmap())
 
     def _display_handshape_result(self):
-        if not self._handshape_paths:
-            self.handshape_label.setText("(참고 이미지 없음)")
-            self.handshape_label.setPixmap(QPixmap())
-            return
-        self._show_handshape_at(0)
+        frames = []
+        for p in self._handshape_paths:
+            frame = cv2.imread(str(p))
+            if frame is not None:
+                frames.append(frame)
+        self._handshape_frames = frames
+        self._set_slider_frames(self.handshape_slider, self.handshape_label, self.handshape_idx_label,
+                                 frames, "(참고 이미지 없음)")
 
-    def _show_handshape_at(self, idx: int):
-        if not self._handshape_paths:
+    def _on_handshape_slider_moved(self, idx: int):
+        if not self._handshape_frames:
             return
-        idx = idx % len(self._handshape_paths)
-        self._handshape_idx = idx
-        frame = cv2.imread(str(self._handshape_paths[idx]))
-        if frame is not None:
-            self.handshape_label.setPixmap(cv2_to_pixmap(frame))
-            if len(self._handshape_paths) > 1:
-                self.handshape_label.setToolTip(f"{idx + 1}/{len(self._handshape_paths)}")
-
-    def _show_next_handshape(self):
-        if self._handshape_paths:
-            self._show_handshape_at(self._handshape_idx + 1)
+        self.handshape_label.setPixmap(cv2_to_pixmap(self._handshape_frames[idx]))
+        self.handshape_idx_label.setText(f"{idx + 1} / {len(self._handshape_frames)}")
 
     def _on_slider_moved(self, value: int):
         self.frame_idx_label.setText(f"프레임: {value} / {self._current_video_total - 1}")
