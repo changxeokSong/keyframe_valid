@@ -279,9 +279,10 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QHBoxLayout(panel)
 
-        # 내 키프레임 (지금 선택된 항목이 태깅된 그 키프레임 - "정답"으로 삼는 기준)
+        # 검토 대상 키프레임 (지금 선택한 행 - 예외처리된 항목이면 그 문제의 영상 키프레임이 여기 뜸)
         left_box, self.my_kf_label, self.my_kf_slider, self.my_kf_idx_label = self._build_slider_panel(
-            "내 키프레임", self._on_my_kf_slider_moved
+            "검토 대상 키프레임 (지금 선택한 항목 — 예외처리된 항목이면 그 영상)",
+            self._on_my_kf_slider_moved,
         )
         btn_manual_kf = QPushButton("키프레임 이미지 직접 지정...")
         btn_manual_kf.clicked.connect(self._pick_manual_keyframe)
@@ -289,9 +290,9 @@ class MainWindow(QMainWindow):
         left_box.addStretch()
         layout.addLayout(left_box)
 
-        # 기준 이미지 (같은 글로스의 다른 정상(비예외) 영상 키프레임 - 진짜 정답 예시)
+        # 정답 기준 이미지 (같은 글로스의 다른 정상(비예외) 영상 키프레임)
         ref_ex_box, self.ref_kf_label, self.ref_kf_slider, self.ref_kf_idx_label = self._build_slider_panel(
-            "기준 이미지 (같은 글로스의 다른 정상 영상)", self._on_ref_kf_slider_moved
+            "정답 기준 이미지 (같은 글로스의 다른 정상 영상)", self._on_ref_kf_slider_moved
         )
         self.ref_kf_source_label = QLabel("")
         self.ref_kf_source_label.setWordWrap(True)
