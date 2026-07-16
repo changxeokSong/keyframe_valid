@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 import sys
 import time
 import webbrowser
@@ -31,7 +32,7 @@ from .. import local_settings
 from ..dataset_config import DEFAULT_CONFIG_PATH, load_dataset_config
 from ..exception_store import DEFAULT_STAGING_DIR, ExceptionStore
 from ..logging_setup import log, log_time
-from ..metadata import DatasetEntry, load_dataset
+from ..metadata import DatasetEntry, entry_key, load_dataset
 from ..paths import HANDSHAPE_CACHE_DIR, REVIEW_LOG_PATH, SAMPLE_EXCEPTION_CSV_PATH, VIDEOS_CACHE_DIR
 from ..pipeline import ValidationResult
 from ..compare import combined_similarity
@@ -87,6 +88,25 @@ def placeholder_pixmap(text: str, size=(IMG_W, IMG_H)) -> QPixmap:
     return pix
 
 
+class NaturalSortItem(QTableWidgetItem):
+    """테이블 정렬 시 문자열 순서(1,10,2,3...)가 아니라 숫자 순서(1,2,3...,10)로
+    비교한다. origin_no처럼 숫자로만 된 값이 자릿수 기준으로 정렬되던 문제를 고쳤다."""
+
+    def __lt__(self, other):
+        a, b = self.text(), other.text()
+        try:
+            return float(a) < float(b)
+        except ValueError:
+            pass
+        # "004/1.123.C" 같은 값은 맨 앞 숫자만이라도 뽑아 비교
+        ma, mb = re.match(r"-?\d+", a), re.match(r"-?\d+", b)
+        if ma and mb:
+            na, nb = int(ma.group()), int(mb.group())
+            if na != nb:
+                return na < nb
+        return a < b
+
+
 # 전체 앱에 적용하는 단순/깔끔한 톤의 flat 스타일. 이전엔 위젯마다 제각각
 # 인라인 스타일만 있고 통일된 톤이 없어서 산만해 보였다는 피드백을 반영.
 APP_STYLESHEET = """
@@ -128,11 +148,15 @@ class MainWindow(QMainWindow):
         self._size_to_screen()
 
         self.entries: list[DatasetEntry] = []
+        # 아래 dict들은 전부 origin_no가 아니라 entry_key(origin_no+video_id)로 키를 잡는다.
+        # 같은 글로스(origin_no)를 004/009/011처럼 여러 사람(video_id)이 각자 촬영한
+        # 경우가 흔한데, origin_no만 쓰면 그 사람들의 서로 다른 항목이 하나로 뭉개져서
+        # 검증 결과/정답영상/예외사유가 엉뚱한 사람 것으로 뒤바뀌어 보이는 버그가 있었다.
         self.entry_by_origin: dict[str, DatasetEntry] = {}
         self._entries_by_gloss: dict[str, list[DatasetEntry]] = {}  # gloss_name -> entries (기준 이미지 찾기용)
-        self._item_by_origin: dict[str, QTableWidgetItem] = {}  # origin_no -> col0 item (O(1) 행 찾기용)
-        self.results: dict[str, ValidationResult] = {}
-        self.manual_keyframe: dict[str, Path] = {}
+        self._item_by_origin: dict[str, QTableWidgetItem] = {}  # entry_key -> col0 item (O(1) 행 찾기용)
+        self.results: dict[str, ValidationResult] = {}  # entry_key -> ValidationResult
+        self.manual_keyframe: dict[str, Path] = {}  # entry_key -> Path
         self.dataset_root: Optional[Path] = None
         self.keyframe_images_dir: Optional[Path] = None
         self.exception_store: Optional[ExceptionStore] = None
@@ -144,18 +168,18 @@ class MainWindow(QMainWindow):
         self._best_match_idx: Optional[int] = None
         self._handshape_paths: list[Path] = []
         self._handshape_frames: list[np.ndarray] = []
-        self._handshape_cache: dict[str, list[Path]] = {}  # origin_no -> paths (빈 리스트 = 확인함, 없음)
+        self._handshape_cache: dict[str, list[Path]] = {}  # origin_no -> paths (수형사진은 글로스 공통이라 origin_no만으로 충분)
         self._handshape_thread: Optional[HandshapeFetchThread] = None
         self._my_kf_frames: list[np.ndarray] = []
         self._my_video_path: Optional[Path] = None
-        self._my_kf_cache: dict[str, tuple] = {}  # origin_no -> (frames, video_path|None), NAS 재읽기 방지
+        self._my_kf_cache: dict[str, tuple] = {}  # entry_key -> (frames, video_path|None), NAS 재읽기 방지
         self._ref_kf_frames: list[np.ndarray] = []
         self._ref_kf_sources: list[str] = []
         self._ref_kf_video_paths: list[Optional[Path]] = []  # ref_kf_frames와 같은 길이, 후보별 영상
         self._ref_video_path: Optional[Path] = None  # 지금 슬라이더로 보고 있는 후보의 영상 (재생용)
-        self._ref_kf_cache: dict[tuple, tuple] = {}  # (gloss_name, origin_no) -> (frames, sources, video_paths)
+        self._ref_kf_cache: dict[str, tuple] = {}  # entry_key -> (frames, sources, video_paths)
         self._kf_thread: Optional[KeyframeLoadThread] = None
-        self._kf_thread_origin: Optional[str] = None  # 지금 돌고 있는 KeyframeLoadThread가 어느 origin_no용인지
+        self._kf_thread_origin: Optional[str] = None  # 지금 돌고 있는 KeyframeLoadThread가 어느 entry_key용인지
         self._kf_index_thread: Optional[KeyframeIndexThread] = None
         self._extractors: Optional[Extractors] = None  # 지연 로딩 (첫 비교 때 한 번만 모델 로드)
         self._validating_origin_no: Optional[str] = None
@@ -771,15 +795,21 @@ class MainWindow(QMainWindow):
             return
         path, _ = QFileDialog.getOpenFileName(self, "키프레임 이미지 선택", "", "Images (*.jpg *.jpeg *.png)")
         if path:
-            self.manual_keyframe[entry.origin_no] = Path(path)
-            self._my_kf_cache.pop(entry.origin_no, None)  # 캐시된 값 대신 새로 지정한 이미지를 쓰게
+            key = entry_key(entry)
+            self.manual_keyframe[key] = Path(path)
+            self._my_kf_cache.pop(key, None)  # 캐시된 값 대신 새로 지정한 이미지를 쓰게
             self._show_detail_for(entry)
 
     def _index_entries(self):
-        """entries가 새로 로드될 때 한 번만 인덱싱해둔다. origin_no 조회와
-        같은 gloss_name 찾기(기준 이미지용)를 매번 전체 스캔하면 데이터가
-        많을 때(수천 개) 느려지므로, 여기서 미리 dict로 묶어둔다."""
-        self.entry_by_origin = {e.origin_no: e for e in self.entries}
+        """entries가 새로 로드될 때 한 번만 인덱싱해둔다. 조회와 같은 gloss_name
+        찾기(기준 이미지용)를 매번 전체 스캔하면 데이터가 많을 때(수천 개) 느려지므로,
+        여기서 미리 dict로 묶어둔다.
+
+        키는 origin_no가 아니라 entry_key(origin_no+video_id)를 쓴다 - 같은 글로스를
+        004/009/011처럼 여러 사람이 각자 촬영한 경우가 흔한데, origin_no만 쓰면 그
+        사람들의 서로 다른 항목이 전부 하나로 뭉개져서(나중 것이 앞의 것을 덮어써서)
+        검증 결과/정답영상/예외사유가 엉뚱한 사람 것으로 뒤바뀌어 보이는 버그가 있었다."""
+        self.entry_by_origin = {entry_key(e): e for e in self.entries}
         self._entries_by_gloss: dict[str, list[DatasetEntry]] = {}
         for e in self.entries:
             self._entries_by_gloss.setdefault(e.gloss_name, []).append(e)
@@ -789,7 +819,7 @@ class MainWindow(QMainWindow):
     # ── 테이블 ─────────────────────────────────────────────────────────
     def _visible_entries(self) -> list[DatasetEntry]:
         if self.only_exceptions_cb.isChecked() and self.exception_store is not None:
-            return [e for e in self.entries if self.exception_store.is_exception(e.origin_no)]
+            return [e for e in self.entries if self.exception_store.is_exception(e.origin_no, e.video_id or "")]
         return self.entries
 
     def _refresh_table(self):
@@ -802,8 +832,9 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
 
     def _fill_row(self, row: int, entry: DatasetEntry):
-        result = self.results.get(entry.origin_no)
-        is_exc = self.exception_store.is_exception(entry.origin_no) if self.exception_store else False
+        key = entry_key(entry)
+        result = self.results.get(key)
+        is_exc = self.exception_store.is_exception(entry.origin_no, entry.video_id or "") if self.exception_store else False
 
         status = result.status if result else ""
         score = f"{result.best_score:.4f}" if result and result.best_score is not None else ""
@@ -821,28 +852,31 @@ class MainWindow(QMainWindow):
             bg = QColor(230, 220, 255)
 
         for col, val in enumerate(values):
-            item = QTableWidgetItem(val)
+            item = NaturalSortItem(val)
             item.setBackground(bg)
             self.table.setItem(row, col, item)
             if col == 0:
-                # origin_no -> item 참조를 저장해두면, 정렬로 행 순서가 바뀌어도
+                # entry_key -> item 참조를 저장해두면, 정렬로 행 순서가 바뀌어도
                 # item.row()로 항상 O(1)에 현재 행을 찾을 수 있다 (테이블 전체를
-                # 매번 훑는 건 데이터가 많을 때(수천 개) 눈에 띄게 느려짐)
-                self._item_by_origin[entry.origin_no] = item
+                # 매번 훑는 건 데이터가 많을 때(수천 개) 눈에 띄게 느려짐).
+                # origin_no만으로는 같은 글로스의 다른 사람 행과 겹칠 수 있어서
+                # 화면엔 origin_no를 보여주되 내부 식별은 entry_key로 한다.
+                item.setData(Qt.UserRole, key)
+                self._item_by_origin[key] = item
 
     def _selected_entry(self) -> Optional[DatasetEntry]:
         rows = self.table.selectionModel().selectedRows()
         if not rows:
             return None
-        origin_no = self.table.item(rows[0].row(), 0).text()
-        return self.entry_by_origin.get(origin_no)
+        key = self.table.item(rows[0].row(), 0).data(Qt.UserRole)
+        return self.entry_by_origin.get(key)
 
     def _selected_entries(self) -> list[DatasetEntry]:
         rows = self.table.selectionModel().selectedRows()
         out = []
         for r in rows:
-            origin_no = self.table.item(r.row(), 0).text()
-            e = self.entry_by_origin.get(origin_no)
+            key = self.table.item(r.row(), 0).data(Qt.UserRole)
+            e = self.entry_by_origin.get(key)
             if e:
                 out.append(e)
         return out
@@ -880,41 +914,45 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.stop()
 
-    def _row_of(self, origin_no: str) -> Optional[int]:
-        """origin_no의 현재 테이블 행 번호를 O(1)에 찾는다 (정렬돼도 안전).
-        데이터가 수천 개일 때 매번 테이블 전체를 훑으면 눈에 띄게 느려진다."""
-        item = self._item_by_origin.get(origin_no)
+    def _row_of(self, key: str) -> Optional[int]:
+        """entry_key(origin_no+video_id)의 현재 테이블 행 번호를 O(1)에 찾는다
+        (정렬돼도 안전). 데이터가 수천 개일 때 매번 테이블 전체를 훑으면 눈에
+        띄게 느려진다. origin_no만으로는 같은 글로스의 다른 사람 행과 겹칠 수
+        있어서 반드시 entry_key를 써야 한다."""
+        item = self._item_by_origin.get(key)
         return item.row() if item is not None else None
 
-    def _on_result_ready(self, origin_no: str, result: ValidationResult):
-        self.results[origin_no] = result
-        row = self._row_of(origin_no)
-        if row is not None:
-            self._fill_row(row, self.entry_by_origin[origin_no])
+    def _on_result_ready(self, key: str, result: ValidationResult):
+        self.results[key] = result
+        row = self._row_of(key)
+        if row is not None and key in self.entry_by_origin:
+            self._fill_row(row, self.entry_by_origin[key])
         entry = self._selected_entry()
-        if entry and entry.origin_no == origin_no:
+        if entry and entry_key(entry) == key:
             self._show_detail_for(entry)
 
     def _on_progress(self, done: int, total: int):
         self.progress_bar.setValue(done)
 
-    def _on_frame_progress(self, origin_no: str, frame: np.ndarray, score: Optional[float]):
+    def _on_frame_progress(self, key: str, frame: np.ndarray, score: Optional[float]):
         """검증 중인 프레임을 실시간으로 보여준다 (YOLO+MediaPipe가 실제로
         사람을 잡고 있는지 눈으로 바로 확인 가능). 처리 중인 항목이 바뀌면
         테이블에서도 그 행을 자동으로 선택/스크롤해서, 상세 패널(내 키프레임/
         사전 동영상/수형사진)이 지금 검증 중인 글로스를 같이 보여주게 한다.
         """
         self.live_preview_label.setPixmap(cv2_to_pixmap(frame, size=(160, 120)))
-        gloss = self.entry_by_origin.get(origin_no)
-        gloss_name = gloss.gloss_name if gloss else ""
+        entry = self.entry_by_origin.get(key)
+        gloss_name = entry.gloss_name if entry else ""
+        video_id = entry.video_id if entry else ""
         score_txt = f"{score:.4f}" if score is not None else "검출 안 됨"
         self.live_preview_text.setText(
-            f"검증 중: origin_no={origin_no} ({gloss_name})  |  현재 프레임 유사도: {score_txt}"
+            f"검증 중: origin_no={entry.origin_no if entry else key} ({gloss_name}, {video_id})  |  "
+            f"현재 프레임 유사도: {score_txt}"
         )
 
-        if origin_no != self._validating_origin_no:
-            self._validating_origin_no = origin_no
-            row = self._row_of(origin_no)
+        if key != self._validating_origin_no:
+            self._validating_origin_no = key
+            row = self._row_of(key)
             if row is not None:
                 self.table.selectRow(row)
                 self.table.scrollToItem(self.table.item(row, 0))
@@ -966,16 +1004,16 @@ class MainWindow(QMainWindow):
         self._release_current_cap()
         self._pending_loads.clear()  # 새로 선택했으니 로딩 상태를 이 항목 기준으로 다시 계산
         self.my_vs_ref_label.setText("검토대상 vs 정답 직접비교: -")
-        result = self.results.get(entry.origin_no)
-        is_exc = self.exception_store.is_exception(entry.origin_no) if self.exception_store else False
+        key = entry_key(entry)
+        result = self.results.get(key)
+        is_exc = self.exception_store.is_exception(entry.origin_no, entry.video_id or "") if self.exception_store else False
 
         # 내 키프레임 + 기준 이미지 표시. NAS 읽기가 항목당 4~5초씩 걸리는 게
         # 확인돼서, 캐시에 없으면 메인 스레드를 막지 않게 백그라운드로 돌린다.
-        origin_no = entry.origin_no
         self._stop_side_play("my")
         self._stop_side_play("ref")
-        my_cached = self._my_kf_cache.get(origin_no)
-        ref_cached = self._ref_kf_cache.get((entry.gloss_name, origin_no))
+        my_cached = self._my_kf_cache.get(key)
+        ref_cached = self._ref_kf_cache.get(key)
 
         if my_cached is not None:
             self._my_kf_frames, my_video_str = my_cached
@@ -1007,16 +1045,16 @@ class MainWindow(QMainWindow):
 
         already_loading_this_row = (
             self._kf_thread is not None and self._kf_thread.isRunning()
-            and self._kf_thread_origin == origin_no
+            and self._kf_thread_origin == key
         )
         if (my_cached is None or ref_cached is None) and not already_loading_this_row:
             # 이전 요청(다른 행용)이 아직 안 끝났으면 그냥 흘려보낸다 - 그 결과가 나중에
-            # 도착해도 _on_keyframe_loaded에서 origin_no가 지금 선택과 다르면 화면에는
+            # 도착해도 _on_keyframe_loaded에서 entry_key가 지금 선택과 다르면 화면에는
             # 반영 안 하고 캐시에만 저장하므로 안전하다(엉뚱한 행에 다른 행 결과가 섞이는 것 방지).
             self._pending_loads.add("keyframe")
             ref_entries = self._find_reference_entries(entry)
-            manual_override = self.manual_keyframe.get(origin_no)
-            self._kf_thread_origin = origin_no
+            manual_override = self.manual_keyframe.get(key)
+            self._kf_thread_origin = key
             self._kf_thread = KeyframeLoadThread(
                 entry, ref_entries, self.keyframe_images_dir, self.dataset_root, manual_override
             )
@@ -1052,20 +1090,21 @@ class MainWindow(QMainWindow):
         log.info(f"[gui] 행 선택 처리 완료: {time.perf_counter() - t_total:.3f}초 (수형사진은 비동기라 미포함)")
 
         # 텍스트 요약
-        if is_exc:
-            reviewers = self.exception_store.get_all_reviewers(entry.origin_no)
+        if is_exc and self.exception_store:
+            reviewers = self.exception_store.get_all_reviewers(entry.origin_no, entry.video_id or "")
             parts = []
             for rev, row in reviewers:
                 p = f"{rev}: {row.moved_at}"
                 if row.reason:
                     p += f" — 사유: {row.reason}"
                 parts.append(p)
-            exc_desc = "예외 (" + "; ".join(parts) + ")"
+            exc_desc = ("예외 (" + "; ".join(parts) + ")") if parts else "예외 (사유 정보 없음)"
         else:
             exc_desc = "정상"
         lines = [
             f"origin_no: {entry.origin_no}",
             f"gloss_name: {entry.gloss_name}",
+            f"video_id(사람): {entry.video_id or '-'}",
             f"gloss_description: {entry.gloss_description}",
             f"metadata keyframes: {entry.keyframes}",
             f"기존 예외처리 상태: {exc_desc}",
@@ -1097,24 +1136,25 @@ class MainWindow(QMainWindow):
         self.btn_restore.setEnabled(is_exc)
         self.btn_mark_exception.setEnabled(not is_exc)
 
-    def _on_keyframe_loaded(self, origin_no: str, my_frames: list, my_video_path: str,
+    def _on_keyframe_loaded(self, key: str, my_frames: list, my_video_path: str,
                              gloss_name: str, ref_frames: list, ref_sources: list, ref_video_paths: list):
         """KeyframeLoadThread가 NAS에서 다 읽어온 뒤 호출됨. 캐시에 저장해두고,
-        지금도 그 행/글로스를 보고 있으면 화면을 갱신한다(그 사이 다른 행을
-        클릭했으면 화면은 안 건드리고 캐시만 채워둠)."""
-        self._my_kf_cache[origin_no] = (my_frames, my_video_path or None)
-        # gloss_name만으로 키를 잡으면 같은 글로스의 다른 행이 빨리 연달아 선택됐을 때
-        # 서로 다른 origin_no용으로 계산된(자기 자신은 제외하고 찾은) 후보 목록이 뒤섞여
-        # "내 영상이 다른 정상 영상으로 보이는" 등의 오염이 생겼다. origin_no까지 같이
-        # 키로 써서 행마다 완전히 분리한다.
-        self._ref_kf_cache[(gloss_name, origin_no)] = (ref_frames, ref_sources, ref_video_paths)
-        if self._kf_thread_origin == origin_no:
+        지금도 그 행을 보고 있으면 화면을 갱신한다(그 사이 다른 행을 클릭했으면
+        화면은 안 건드리고 캐시만 채워둠).
+
+        key는 entry_key(origin_no+video_id) - origin_no만으로 키를 잡으면 같은
+        글로스를 여러 사람이 촬영한 경우 서로 다른 사람용으로 계산된(자기 자신은
+        제외하고 찾은) 후보 목록이 뒤섞여 "내 영상이 다른 정상 영상으로 보이는"
+        등의 오염이 생겼다."""
+        self._my_kf_cache[key] = (my_frames, my_video_path or None)
+        self._ref_kf_cache[key] = (ref_frames, ref_sources, ref_video_paths)
+        if self._kf_thread_origin == key:
             self._kf_thread_origin = None
 
         entry = self._selected_entry()
         if entry is None:
             return
-        if entry.origin_no == origin_no:
+        if entry_key(entry) == key:
             self._my_kf_frames = my_frames
             self._my_video_path = Path(my_video_path) if my_video_path else None
             self._set_slider_frames(self.my_kf_slider, self.my_kf_label, self.my_kf_idx_label,
@@ -1240,7 +1280,7 @@ class MainWindow(QMainWindow):
         entry = self._selected_entry()
         if entry is None:
             return ""
-        result = self.results.get(entry.origin_no)
+        result = self.results.get(entry_key(entry))
         if result is None or not result.keyframe_frame_indices or idx >= len(entry.keyframes):
             return ""
         frame_idx = entry.keyframes[idx]
@@ -1254,11 +1294,17 @@ class MainWindow(QMainWindow):
     def _find_reference_entries(self, entry: DatasetEntry) -> list[DatasetEntry]:
         """같은 gloss_name을 가진 다른 항목들 - "정답" 예시로 쓸 후보.
         예외처리 안 된(정상) 항목을 우선한다. 정상이 하나도 없으면 예외 항목이라도 보여준다.
-        미리 만들어둔 gloss_name 인덱스를 쓰므로 전체 항목을 다시 훑지 않는다."""
+        미리 만들어둔 gloss_name 인덱스를 쓰므로 전체 항목을 다시 훑지 않는다.
+
+        origin_no가 아니라 entry_key로 "자기 자신"만 제외한다 - 같은 글로스를 여러
+        사람(video_id)이 각자 촬영한 경우 그 사람들은 origin_no가 전부 같아서,
+        origin_no만으로 제외하면 정작 보여줘야 할 "다른 사람들의 정상 영상"까지
+        전부 걸러져 사라지는 버그가 있었다."""
+        this_key = entry_key(entry)
         same_gloss = self._entries_by_gloss.get(entry.gloss_name, [])
-        others = [e for e in same_gloss if e.origin_no != entry.origin_no]
+        others = [e for e in same_gloss if entry_key(e) != this_key]
         if self.exception_store is not None:
-            normal = [e for e in others if not self.exception_store.is_exception(e.origin_no)]
+            normal = [e for e in others if not self.exception_store.is_exception(e.origin_no, e.video_id or "")]
             if normal:
                 return normal
         return others
@@ -1470,14 +1516,14 @@ class MainWindow(QMainWindow):
             return
         self._ensure_exception_store()
 
-        already = [e for e in entries if self.exception_store.is_exception(e.origin_no)]
+        already = [e for e in entries if self.exception_store.is_exception(e.origin_no, e.video_id or "")]
         targets = [e for e in entries if e not in already]
 
         if not targets:
             QMessageBox.information(self, "안내", f"선택한 {len(entries)}개 항목 모두 이미 예외처리되어 있습니다 (중복 방지로 건너뜀).")
             return
 
-        names = ", ".join(f"{e.gloss_name}({e.origin_no})" for e in targets[:5])
+        names = ", ".join(f"{e.gloss_name}({e.origin_no}, {e.video_id or '-'})" for e in targets[:5])
         if len(targets) > 5:
             names += f" 외 {len(targets) - 5}개"
         reason, ok = QInputDialog.getMultiLineText(
@@ -1499,7 +1545,7 @@ class MainWindow(QMainWindow):
                 entry.origin_no, entry.gloss_name, entry.video_id or "", reason=reason.strip()
             )
             self._append_review_log(entry, "EXCEPTION", reason.strip())
-            self._fill_row_by_origin(entry.origin_no)
+            self._fill_row_by_origin(entry_key(entry))
 
         sel = self._selected_entry()
         if sel:
@@ -1512,7 +1558,7 @@ class MainWindow(QMainWindow):
         if not entries or self.exception_store is None:
             return
 
-        targets = [e for e in entries if self.exception_store.is_exception(e.origin_no)]
+        targets = [e for e in entries if self.exception_store.is_exception(e.origin_no, e.video_id or "")]
         if not targets:
             QMessageBox.information(self, "안내", "선택한 항목 중 예외처리된 것이 없습니다.")
             return
@@ -1527,35 +1573,45 @@ class MainWindow(QMainWindow):
             return
 
         for entry in targets:
-            if self.exception_store.restore(entry.origin_no):
+            if self.exception_store.restore(entry.origin_no, entry.video_id or ""):
                 self._append_review_log(entry, "RESTORED")
-            self._fill_row_by_origin(entry.origin_no)
+            self._fill_row_by_origin(entry_key(entry))
 
         sel = self._selected_entry()
         if sel:
             self._show_detail_for(sel)
-        self._fill_row_by_origin(entry.origin_no)
-        self._show_detail_for(entry)
 
-    def _fill_row_by_origin(self, origin_no: str):
-        row = self._row_of(origin_no)
+    def _fill_row_by_origin(self, key: str):
+        row = self._row_of(key)
         if row is not None:
-            self._fill_row(row, self.entry_by_origin[origin_no])
+            self._fill_row(row, self.entry_by_origin[key])
 
     def _append_review_log(self, entry: DatasetEntry, decision: str, reason: str = ""):
-        result = self.results.get(entry.origin_no)
+        """검토 결정 이력. video_id는 같은 origin_no(글로스)를 여러 사람(subset)이
+        각자 촬영한 경우 '정확히 누구의 영상을 검토했는지' 구분하는 데 필요해서
+        기록한다 - origin_no만으로는 나중에 리포트에서 어느 사람 영상이었는지 알 수 없다.
+        이미 예전 포맷(video_id 없음)으로 파일이 있으면 그 헤더를 그대로 따라가서
+        기존 행과 컬럼이 어긋나지 않게 한다."""
+        result = self.results.get(entry_key(entry))
         DEFAULT_REVIEW_LOG.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = ["origin_no", "gloss_name", "video_id", "decision", "best_score", "reason", "reviewed_at"]
         is_new = not DEFAULT_REVIEW_LOG.exists()
+        if not is_new:
+            with open(DEFAULT_REVIEW_LOG, "r", encoding="utf-8-sig", newline="") as f:
+                existing_header = next(csv.reader(f), None)
+            if existing_header and "video_id" not in existing_header:
+                fieldnames = existing_header
+        row = {
+            "origin_no": entry.origin_no, "gloss_name": entry.gloss_name,
+            "video_id": entry.video_id or "", "decision": decision,
+            "best_score": f"{result.best_score:.4f}" if result and result.best_score is not None else "",
+            "reason": reason, "reviewed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
         with open(DEFAULT_REVIEW_LOG, "a", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             if is_new:
-                writer.writerow(["origin_no", "gloss_name", "decision", "best_score", "reason", "reviewed_at"])
-            writer.writerow([
-                entry.origin_no, entry.gloss_name, decision,
-                f"{result.best_score:.4f}" if result and result.best_score is not None else "",
-                reason,
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            ])
+                writer.writeheader()
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
 
     def _open_in_browser(self):
         entry = self._selected_entry()

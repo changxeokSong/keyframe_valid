@@ -19,6 +19,8 @@ from typing import Iterator, Optional
 
 import openpyxl
 
+from .logging_setup import log
+
 
 @dataclass
 class DatasetEntry:
@@ -30,26 +32,46 @@ class DatasetEntry:
     gloss_description: str = ""
 
 
+def entry_key(entry: DatasetEntry) -> str:
+    """entry의 유일 식별자. origin_no(글로스 번호)만으로는 부족하다 - 같은 글로스를
+    004/009/011처럼 여러 사람(subset)이 각자 따로 촬영한 경우가 흔한데, origin_no만
+    키로 쓰면 그 사람들의 서로 다른 영상이 전부 한 항목으로 뭉개진다(직접 확인된 버그:
+    검증 결과/예외처리 사유/정답 영상이 다른 사람 것으로 뒤바뀌어 보임). 그래서
+    origin_no+video_id를 합쳐서 인스턴스 단위로 구분한다."""
+    return f"{entry.origin_no}#{entry.video_id or ''}"
+
+
 def load_from_excel(xlsx_path: Path) -> Iterator[DatasetEntry]:
     wb = openpyxl.load_workbook(str(xlsx_path), read_only=True, data_only=True)
     ws = wb["Sign_Gloss"]
+    seen: set[str] = set()
+    n_dup = 0
     for row in ws.iter_rows(min_row=2, values_only=True):
         origin = row[1]
         name = row[2]
         if origin is None or not name:
             continue
+        origin_no = str(int(origin))
+        if origin_no in seen:
+            n_dup += 1
+            continue
+        seen.add(origin_no)
         kf_str = str(row[8] or "").strip()
         keyframes = [int(t) for t in kf_str.split() if t.strip().isdigit()]
         yield DatasetEntry(
-            origin_no=str(int(origin)),
+            origin_no=origin_no,
             gloss_name=str(name).strip(),
             keyframes=keyframes,
             gloss_description=str(row[3] or "").strip(),
         )
     wb.close()
+    if n_dup:
+        log.info(f"[metadata] xlsx 중복 행 {n_dup}개 건너뜀 (origin_no 기준)")
 
 
 def load_from_metadata_csv(csv_path: Path) -> Iterator[DatasetEntry]:
+    seen: set[tuple] = set()
+    n_dup = 0
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -57,16 +79,30 @@ def load_from_metadata_csv(csv_path: Path) -> Iterator[DatasetEntry]:
             name = (row.get("gloss_name") or "").strip()
             if not origin or not name:
                 continue
+            video_id = (row.get("video_id") or "").strip() or None
+            video_rel_path = (row.get("video_path") or "").strip() or None
+            # video_id(예: "011/1.011.C")는 이 gloss를 촬영한 "사람"(subset) 식별자라서,
+            # 같은 origin_no라도 video_id가 다르면 서로 다른 사람의 서로 다른 영상이라
+            # 별개 항목으로 남겨야 한다. 반대로 origin_no+video_id가 완전히 같은 행이
+            # 여러 번 있으면(직접 확인: 사용자 데이터에서 동일 행 3연속) 소스 CSV 쪽
+            # 중복이므로 첫 번째만 남긴다.
+            dedup_key = (origin, video_id or video_rel_path or name)
+            if dedup_key in seen:
+                n_dup += 1
+                continue
+            seen.add(dedup_key)
             kf_str = (row.get("keyframes") or "").strip()
             keyframes = [int(t) for t in kf_str.split() if t.strip().isdigit()]
             yield DatasetEntry(
                 origin_no=origin,
                 gloss_name=name,
                 keyframes=keyframes,
-                video_rel_path=(row.get("video_path") or "").strip() or None,
-                video_id=(row.get("video_id") or "").strip() or None,
+                video_rel_path=video_rel_path,
+                video_id=video_id,
                 gloss_description=(row.get("gloss_description") or "").strip(),
             )
+    if n_dup:
+        log.info(f"[metadata] metadata.csv 중복 행 {n_dup}개 건너뜀 (origin_no+video_id 기준)")
 
 
 def load_dataset(path: Path) -> list[DatasetEntry]:

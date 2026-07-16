@@ -9,7 +9,9 @@ sldict 사이트의 '수형 사진'은 일러스트(선화)라 MediaPipe/YOLO가
 
 from __future__ import annotations
 
+import os
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -93,9 +95,17 @@ def _get_local_video_copy(nas_path: Path) -> Path:
         return local_path
 
     t0 = time.perf_counter()
-    tmp_path = local_path.with_suffix(local_path.suffix + ".part")
-    shutil.copyfile(nas_path, tmp_path)
-    tmp_path.rename(local_path)
+    # 같은 영상을 서로 다른 행에서 거의 동시에 열면(예: 검토대상/정답 패널이
+    # 동시에 같은 영상을 참조) 두 스레드가 동시에 이 함수에 들어올 수 있다.
+    # 임시 파일명에 스레드 id를 넣어 서로 다른 스레드가 같은 .part 파일에
+    # 동시에 쓰는 걸 막고, os.replace로 원자적 교체를 써서 Windows에서
+    # 목적지 파일이 이미 있으면 rename이 실패하는 문제(직접 확인된 크래시)도 피한다.
+    tmp_path = local_path.with_suffix(f"{local_path.suffix}.{threading.get_ident()}.part")
+    try:
+        shutil.copyfile(nas_path, tmp_path)
+        os.replace(tmp_path, local_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
     log.info(
         f"[keyframe_images] NAS 영상 로컬 캐시 복사: {nas_path.name} "
         f"({nas_size / 1024:.0f}KB), {time.perf_counter() - t0:.3f}초"

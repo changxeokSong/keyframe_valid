@@ -16,14 +16,14 @@ from ..keyframe_images import (
     load_instance_keyframes,
     resolve_instance_video_path,
 )
-from ..metadata import DatasetEntry
+from ..metadata import DatasetEntry, entry_key
 from ..pipeline import Extractors, ValidationResult, validate_entry
 
 
 class ValidationWorker(QThread):
-    result_ready = pyqtSignal(str, object)   # origin_no, ValidationResult
+    result_ready = pyqtSignal(str, object)   # entry_key(origin_no+video_id), ValidationResult
     progress = pyqtSignal(int, int)          # done, total
-    frame_progress = pyqtSignal(str, object, object)  # origin_no, frame(ndarray), score(float|None)
+    frame_progress = pyqtSignal(str, object, object)  # entry_key, frame(ndarray), score(float|None)
     log = pyqtSignal(str)
     finished_all = pyqtSignal()
 
@@ -70,14 +70,14 @@ class ValidationWorker(QThread):
                     keyframe_images_dir=self.keyframe_images_dir,
                     threshold=self.threshold, stride=self.stride,
                     session=session,
-                    on_frame=lambda idx, frame, score, o=entry.origin_no: (
-                        self.frame_progress.emit(o, frame, score)
+                    on_frame=lambda idx, frame, score, k=entry_key(entry): (
+                        self.frame_progress.emit(k, frame, score)
                     ),
                 )
             except Exception as e:  # noqa: BLE001 - 개별 항목 실패로 전체가 멈추면 안 됨
                 result = ValidationResult(entry.origin_no, entry.gloss_name, "ERROR", note=str(e))
 
-            self.result_ready.emit(entry.origin_no, result)
+            self.result_ready.emit(entry_key(entry), result)
             self.progress.emit(i + 1, total)
 
         self.finished_all.emit()
@@ -116,8 +116,8 @@ class KeyframeLoadThread(QThread):
     """
 
     finished_loading = pyqtSignal(str, list, str, str, list, list, list)
-    # origin_no, my_kf_frames, my_video_path, gloss_name, ref_kf_frames, ref_kf_sources,
-    # ref_video_paths (ref_kf_frames와 같은 길이 - 각 후보 이미지마다 재생할 영상, 없으면 "")
+    # entry_key(origin_no+video_id), my_kf_frames, my_video_path, gloss_name, ref_kf_frames,
+    # ref_kf_sources, ref_video_paths (ref_kf_frames와 같은 길이 - 각 후보 이미지마다 재생할 영상, 없으면 "")
 
     def __init__(
         self,
@@ -160,7 +160,7 @@ class KeyframeLoadThread(QThread):
                 ref_video_paths.append(str(v) if v else "")
 
         self.finished_loading.emit(
-            self.entry.origin_no, my_frames, str(my_video_path) if my_video_path else "",
+            entry_key(self.entry), my_frames, str(my_video_path) if my_video_path else "",
             self.entry.gloss_name, ref_frames, ref_sources, ref_video_paths,
         )
 
