@@ -48,15 +48,31 @@ def find_keyframe_images(keyframe_images_dir: Path, origin_no: str) -> list[Path
     return sorted(matches, key=sort_key)
 
 
-def load_keyframe_candidates(
-    entry,  # DatasetEntry (타입 힌트 생략 - metadata.py와의 순환 import 방지)
-    keyframe_images_dir: Optional[Path] = None,
-    dataset_root: Optional[Path] = None,
-    manual_override: Optional[Path] = None,
-) -> list[np.ndarray]:
-    """'검토 대상/정답' 키프레임으로 보여줄 프레임들을 전부 모아서 반환.
-    우선순위: 수동 지정 이미지 > NAS keyframe_images 실제 사진(여러 장 가능) >
-    NAS 원본 비디오의 태깅된 키프레임 인덱스들(여러 개 가능).
+def load_gloss_reference_images(entry, keyframe_images_dir: Optional[Path] = None) -> list[np.ndarray]:
+    """keyframe_images/{origin_no}_{gloss}_{idx}.jpg — origin_no(글로스) 단위로만
+    저장돼 있고 사람/subset(003/004/005/009/010/011/012) 구분이 없다. 즉 이 사진은
+    "이 글로스가 정상적으로는 이렇게 생겼다"는 글로스 공통 기준(=정답)이지,
+    특정 영상 인스턴스의 실제 내용이 아니다. '정답' 패널 전용으로만 써야 한다.
+    """
+    if keyframe_images_dir is None:
+        return []
+    t0 = time.perf_counter()
+    matches = find_keyframe_images(keyframe_images_dir, entry.origin_no)
+    frames = [f for f in (cv2.imread(str(m)) for m in matches) if f is not None]
+    log.debug(
+        f"[keyframe_images] NAS keyframe_images(글로스 공통) 읽기 origin_no={entry.origin_no}: "
+        f"{time.perf_counter() - t0:.3f}초, {len(frames)}장"
+    )
+    return frames
+
+
+def load_instance_keyframes(entry, dataset_root: Optional[Path] = None,
+                             manual_override: Optional[Path] = None) -> list[np.ndarray]:
+    """'검토 대상' 전용: 지금 선택된 그 특정 영상 인스턴스(사람/subset) 자체의
+    실제 키프레임. metadata.csv의 video_rel_path/keyframes는 그 행이 가리키는
+    영상 파일 하나에 묶여 있으므로, keyframe_images(글로스 공통)와 달리 인스턴스별로
+    다른 내용을 정확히 보여준다. 예외 의심 영상이면 그 잘못된 내용이 그대로 나와야
+    검토가 의미 있다 - 그래서 keyframe_images는 여기서 아예 안 쓴다.
 
     NAS 파일 읽기는 네트워크 지연으로 몇 초씩 걸릴 수 있으므로(직접 확인됨),
     이 함수는 GUI에서 호출할 때 반드시 백그라운드 스레드(worker.KeyframeLoadThread)
@@ -66,17 +82,6 @@ def load_keyframe_candidates(
         frame = cv2.imread(str(manual_override))
         if frame is not None:
             return [frame]
-
-    if keyframe_images_dir is not None:
-        t0 = time.perf_counter()
-        matches = find_keyframe_images(keyframe_images_dir, entry.origin_no)
-        frames = [f for f in (cv2.imread(str(m)) for m in matches) if f is not None]
-        log.debug(
-            f"[keyframe_images] NAS keyframe_images 읽기 origin_no={entry.origin_no}: "
-            f"{time.perf_counter() - t0:.3f}초, {len(frames)}장"
-        )
-        if frames:
-            return frames
 
     if dataset_root is not None and getattr(entry, "video_rel_path", None) and entry.keyframes:
         video_path = Path(dataset_root) / entry.video_rel_path
@@ -91,7 +96,7 @@ def load_keyframe_candidates(
                     frames.append(frame)
             cap.release()
             log.debug(
-                f"[keyframe_images] NAS 원본 비디오 프레임 읽기 {video_path.name}: "
+                f"[keyframe_images] NAS 원본 비디오(인스턴스 전용) 프레임 읽기 {video_path.name}: "
                 f"{time.perf_counter() - t0:.3f}초, {len(frames)}장"
             )
             if frames:

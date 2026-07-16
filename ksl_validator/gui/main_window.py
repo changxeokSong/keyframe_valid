@@ -744,7 +744,7 @@ class MainWindow(QMainWindow):
         if my_cached is not None:
             self._my_kf_frames = my_cached
             self._set_slider_frames(self.my_kf_slider, self.my_kf_label, self.my_kf_idx_label,
-                                     self._my_kf_frames, "(키프레임 없음 - NAS 미마운트\n또는 직접 지정 필요)")
+                                     self._my_kf_frames, "(이 영상 인스턴스 키프레임 없음 - NAS 데이터셋 루트\n미마운트 또는 직접 지정 필요. keyframe_images는\n글로스 공통이라 여기엔 안 씀)")
             log.debug(f"[gui]   내 키프레임: 캐시 사용, {len(self._my_kf_frames)}장")
         else:
             self.my_kf_label.setText("(불러오는 중... NAS 읽기라 몇 초 걸릴 수 있음)")
@@ -845,7 +845,7 @@ class MainWindow(QMainWindow):
         if entry.origin_no == origin_no:
             self._my_kf_frames = my_frames
             self._set_slider_frames(self.my_kf_slider, self.my_kf_label, self.my_kf_idx_label,
-                                     my_frames, "(키프레임 없음 - NAS 미마운트\n또는 직접 지정 필요)")
+                                     my_frames, "(이 영상 인스턴스 키프레임 없음 - NAS 데이터셋 루트\n미마운트 또는 직접 지정 필요. keyframe_images는\n글로스 공통이라 여기엔 안 씀)")
         if entry.gloss_name == gloss_name:
             self._ref_kf_frames = ref_frames
             self._ref_kf_sources = ref_sources

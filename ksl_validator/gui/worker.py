@@ -9,7 +9,7 @@ import requests
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from .. import sldict_client
-from ..keyframe_images import load_keyframe_candidates
+from ..keyframe_images import load_gloss_reference_images, load_instance_keyframes
 from ..metadata import DatasetEntry
 from ..pipeline import Extractors, ValidationResult, validate_entry
 
@@ -129,17 +129,21 @@ class KeyframeLoadThread(QThread):
         self.manual_override = manual_override
 
     def run(self):
-        my_frames = load_keyframe_candidates(
-            self.entry, self.keyframe_images_dir, self.dataset_root, self.manual_override
-        )
+        # 검토 대상: 지금 선택된 그 인스턴스(사람/subset) 자체의 실제 키프레임만.
+        # keyframe_images는 글로스 공통(=정답)이라 여기서는 절대 안 쓴다 -
+        # 안 그러면 어느 행을 클릭해도 같은 "정답"만 보여서 검토가 무의미해진다.
+        my_frames = load_instance_keyframes(self.entry, self.dataset_root, self.manual_override)
 
-        ref_frames = []
-        ref_sources = []
+        # 정답: 이 글로스의 공통 기준사진(keyframe_images)을 먼저 보여주고,
+        # 그 다음에 같은 글로스의 다른 정상 영상들의 실제 키프레임을 추가로 붙인다.
+        ref_frames = list(load_gloss_reference_images(self.entry, self.keyframe_images_dir))
+        ref_sources = [f"출처: 글로스 공통 기준사진 (origin_no={self.entry.origin_no})" for _ in ref_frames]
+
         for e in self.ref_entries[:5]:
-            candidates = load_keyframe_candidates(e, self.keyframe_images_dir, self.dataset_root, None)
+            candidates = load_instance_keyframes(e, self.dataset_root, None)
             if candidates:
                 ref_frames.append(candidates[0])
-                ref_sources.append(f"출처: origin_no={e.origin_no} ({e.gloss_name})")
+                ref_sources.append(f"출처: 다른 정상 영상 origin_no={e.origin_no} ({e.gloss_name})")
 
         self.finished_loading.emit(
             self.entry.origin_no, my_frames, self.entry.gloss_name, ref_frames, ref_sources
