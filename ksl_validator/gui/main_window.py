@@ -114,8 +114,9 @@ class MainWindow(QMainWindow):
         self._my_kf_cache: dict[str, tuple] = {}  # origin_no -> (frames, video_path|None), NAS 재읽기 방지
         self._ref_kf_frames: list[np.ndarray] = []
         self._ref_kf_sources: list[str] = []
-        self._ref_video_path: Optional[Path] = None
-        self._ref_kf_cache: dict[str, tuple] = {}  # gloss_name -> (frames, sources, video_path|None)
+        self._ref_kf_video_paths: list[Optional[Path]] = []  # ref_kf_frames와 같은 길이, 후보별 영상
+        self._ref_video_path: Optional[Path] = None  # 지금 슬라이더로 보고 있는 후보의 영상 (재생용)
+        self._ref_kf_cache: dict[str, tuple] = {}  # gloss_name -> (frames, sources, video_paths)
         self._kf_thread: Optional[KeyframeLoadThread] = None
         self._extractors: Optional[Extractors] = None  # 지연 로딩 (첫 비교 때 한 번만 모델 로드)
         self._validating_origin_no: Optional[str] = None
@@ -823,12 +824,13 @@ class MainWindow(QMainWindow):
             self.btn_my_play.setEnabled(False)
 
         if ref_cached is not None:
-            self._ref_kf_frames, ref_sources, ref_video_str = ref_cached
+            self._ref_kf_frames, ref_sources, ref_video_strs = ref_cached
             self._ref_kf_sources = ref_sources
-            self._ref_video_path = Path(ref_video_str) if ref_video_str else None
+            self._ref_kf_video_paths = [Path(v) if v else None for v in ref_video_strs]
             self._set_slider_frames(self.ref_kf_slider, self.ref_kf_label, self.ref_kf_idx_label,
                                      self._ref_kf_frames, "(같은 글로스의 다른 정상 영상을 못 찾음)")
             self.ref_kf_source_label.setText(ref_sources[0] if ref_sources else "")
+            self._ref_video_path = self._ref_kf_video_paths[0] if self._ref_kf_video_paths else None
             self.btn_ref_play.setEnabled(self._ref_video_path is not None)
             log.debug(f"[gui]   기준 이미지: 캐시 사용, {len(self._ref_kf_frames)}장")
         else:
@@ -921,12 +923,12 @@ class MainWindow(QMainWindow):
         self.btn_mark_exception.setEnabled(not is_exc)
 
     def _on_keyframe_loaded(self, origin_no: str, my_frames: list, my_video_path: str,
-                             gloss_name: str, ref_frames: list, ref_sources: list, ref_video_path: str):
+                             gloss_name: str, ref_frames: list, ref_sources: list, ref_video_paths: list):
         """KeyframeLoadThread가 NAS에서 다 읽어온 뒤 호출됨. 캐시에 저장해두고,
         지금도 그 행/글로스를 보고 있으면 화면을 갱신한다(그 사이 다른 행을
         클릭했으면 화면은 안 건드리고 캐시만 채워둠)."""
         self._my_kf_cache[origin_no] = (my_frames, my_video_path or None)
-        self._ref_kf_cache[gloss_name] = (ref_frames, ref_sources, ref_video_path or None)
+        self._ref_kf_cache[gloss_name] = (ref_frames, ref_sources, ref_video_paths)
 
         entry = self._selected_entry()
         if entry is None:
@@ -940,10 +942,11 @@ class MainWindow(QMainWindow):
         if entry.gloss_name == gloss_name:
             self._ref_kf_frames = ref_frames
             self._ref_kf_sources = ref_sources
-            self._ref_video_path = Path(ref_video_path) if ref_video_path else None
+            self._ref_kf_video_paths = [Path(v) if v else None for v in ref_video_paths]
             self._set_slider_frames(self.ref_kf_slider, self.ref_kf_label, self.ref_kf_idx_label,
                                      ref_frames, "(같은 글로스의 다른 정상 영상을 못 찾음)")
             self.ref_kf_source_label.setText(ref_sources[0] if ref_sources else "")
+            self._ref_video_path = self._ref_kf_video_paths[0] if self._ref_kf_video_paths else None
             self.btn_ref_play.setEnabled(self._ref_video_path is not None)
         if entry.origin_no == origin_no or entry.gloss_name == gloss_name:
             self._pending_loads.discard("keyframe")
@@ -1062,10 +1065,15 @@ class MainWindow(QMainWindow):
     def _on_ref_kf_slider_moved(self, idx: int):
         if not self._ref_kf_frames:
             return
+        self._stop_side_play("ref")  # 다른 후보로 넘어가면 재생 중이던 영상은 멈춘다
         self._display_frame(self.ref_kf_label, self._ref_kf_frames[idx])
         self.ref_kf_idx_label.setText(f"{idx + 1} / {len(self._ref_kf_frames)}")
         if idx < len(self._ref_kf_sources):
             self.ref_kf_source_label.setText(self._ref_kf_sources[idx])
+        self._ref_video_path = (
+            self._ref_kf_video_paths[idx] if idx < len(self._ref_kf_video_paths) else None
+        )
+        self.btn_ref_play.setEnabled(self._ref_video_path is not None)
 
     def _load_handshape_images(self, entry: DatasetEntry):
         """사전 사이트의 '수형 사진'(일러스트) 로드. 참고용이며 자동 채점엔 안 씀.

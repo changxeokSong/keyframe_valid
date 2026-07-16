@@ -109,8 +109,9 @@ class KeyframeLoadThread(QThread):
     멈춘다. 그래서 분리했다.
     """
 
-    finished_loading = pyqtSignal(str, list, str, str, list, list, str)
-    # origin_no, my_kf_frames, my_video_path, gloss_name, ref_kf_frames, ref_kf_sources, ref_video_path
+    finished_loading = pyqtSignal(str, list, str, str, list, list, list)
+    # origin_no, my_kf_frames, my_video_path, gloss_name, ref_kf_frames, ref_kf_sources,
+    # ref_video_paths (ref_kf_frames와 같은 길이 - 각 후보 이미지마다 재생할 영상, 없으면 "")
 
     def __init__(
         self,
@@ -137,21 +138,22 @@ class KeyframeLoadThread(QThread):
 
         # 정답: 이 글로스의 공통 기준사진(keyframe_images)을 먼저 보여주고,
         # 그 다음에 같은 글로스의 다른 정상 영상들의 실제 키프레임을 추가로 붙인다.
-        # 재생용 영상은 그 중 실제로 영상 파일이 있는 첫 번째 걸로.
+        # 각 후보 이미지가 "자기 자신의" 영상을 갖고 있는지 하나씩 따로 기록한다 -
+        # 안 그러면 슬라이더로 다른 사진을 보고 있는데 엉뚱한 영상이 재생되거나,
+        # 재생 가능한 후보가 있는데도 재생 버튼이 꺼져있는 문제가 생긴다.
         ref_frames = list(load_gloss_reference_images(self.entry, self.keyframe_images_dir))
         ref_sources = [f"출처: 글로스 공통 기준사진 (origin_no={self.entry.origin_no})" for _ in ref_frames]
-        ref_video_path = None
+        ref_video_paths = ["" for _ in ref_frames]  # 글로스 공통 사진은 대응하는 영상이 없음
 
         for e in self.ref_entries[:5]:
             candidates = load_instance_keyframes(e, self.dataset_root, None)
             if candidates:
                 ref_frames.append(candidates[0])
                 ref_sources.append(f"출처: 다른 정상 영상 origin_no={e.origin_no} ({e.gloss_name})")
-                if ref_video_path is None:
-                    ref_video_path = resolve_instance_video_path(e, self.dataset_root)
+                v = resolve_instance_video_path(e, self.dataset_root)
+                ref_video_paths.append(str(v) if v else "")
 
         self.finished_loading.emit(
             self.entry.origin_no, my_frames, str(my_video_path) if my_video_path else "",
-            self.entry.gloss_name, ref_frames, ref_sources,
-            str(ref_video_path) if ref_video_path else "",
+            self.entry.gloss_name, ref_frames, ref_sources, ref_video_paths,
         )
