@@ -19,3 +19,6 @@ __pycache__/
 
 # Claude Code 로컬 세션 설정 (머신별 권한 승인 상태, 프로젝트 소스 아님)
 .claude/
+
+# 머신별 로컬 설정 (NAS 마운트 경로 등, 컴퓨터마다 다름 - 동기화하면 안 됨)
+.local_settings.json

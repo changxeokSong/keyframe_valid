@@ -9,6 +9,8 @@ Mac에서 같은 NAS를 SMB로 마운트하면 보통 /Volumes/<공유이름>/..
 from __future__ import annotations
 
 import json
+import string
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -64,6 +66,21 @@ def _unc_candidates(unc_or_path: str) -> list[Path]:
         Path("/mnt", server, *rest),                # Linux 일반: /mnt/mldisk2/nfs_shared/...
         Path("/", *rest),                           # 이미 절대경로로 마운트된 경우
     ]
+
+    # 짧은 호스트명(mldisk2)과 FQDN(mldisk2.sogang.ac.kr)이 태깅 툴 내에서도
+    # 문서마다 다르게 쓰여 있어서, 둘 다 UNC 형태로 시도해본다 (Windows에서 유효)
+    if "." not in server:
+        candidates.insert(0, Path(f"//{server}.sogang.ac.kr", *rest))
+    else:
+        short = server.split(".", 1)[0]
+        candidates.insert(0, Path(f"//{short}", *rest))
+
+    # Windows: NAS가 UNC 경로가 아니라 매핑된 드라이브 문자(Z: 등)로 연결된 경우가 흔함.
+    # 각 드라이브 문자 밑에 같은 상대경로가 있는지 훑어본다.
+    if sys.platform == "win32" and rest:
+        for letter in string.ascii_uppercase:
+            candidates.append(Path(f"{letter}:/", *rest))
+
     return candidates
 
 

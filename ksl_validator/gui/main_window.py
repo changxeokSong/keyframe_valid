@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from .. import sldict_client
+from .. import local_settings, sldict_client
 from ..dataset_config import DEFAULT_CONFIG_PATH, load_dataset_config
 from ..exception_store import DEFAULT_STAGING_DIR, ExceptionStore
 from ..keyframe_images import find_keyframe_images
@@ -93,6 +93,7 @@ class MainWindow(QMainWindow):
 
         self._init_ui()
         self._try_autoload_exception_csv()
+        self._try_load_local_settings()
         self._try_autoload_dataset_config()
 
     # ── UI 구성 ────────────────────────────────────────────────────────
@@ -311,18 +312,21 @@ class MainWindow(QMainWindow):
         self.entry_by_origin = {e.origin_no: e for e in self.entries}
         self.meta_label.setText(f"{Path(path).name} ({len(self.entries)}개 항목)")
         self._refresh_table()
+        local_settings.update(metadata_path=path)
 
     def _open_dataset_root(self):
         path = QFileDialog.getExistingDirectory(self, "NAS 데이터셋 루트 선택")
         if path:
             self.dataset_root = Path(path)
             self._update_source_status_label()
+            local_settings.update(dataset_root=path)
 
     def _open_keyframe_images_dir(self):
         path = QFileDialog.getExistingDirectory(self, "키프레임 사진 폴더 선택 (keyframe_images)")
         if path:
             self.keyframe_images_dir = Path(path)
             self._update_source_status_label()
+            local_settings.update(keyframe_images_dir=path)
 
     def _open_exception_csv(self):
         """단일 파일 모드 (로컬 git 샘플 등, 검토자 구분 없는 파일 하나)."""
@@ -336,6 +340,7 @@ class MainWindow(QMainWindow):
         self.exception_store = ExceptionStore(Path(path), reviewer=self.reviewer_edit.text().strip())
         self._update_source_status_label()
         self._refresh_table()
+        local_settings.update(exception_source=path)
 
     def _open_exception_dir(self):
         """디렉토리 모드 (NAS 실제 구조: exception_{이름}.csv 여러 개가 한 폴더에 있음)."""
@@ -347,14 +352,52 @@ class MainWindow(QMainWindow):
         self.exception_store = ExceptionStore(Path(path), reviewer=self.reviewer_edit.text().strip())
         self._update_source_status_label()
         self._refresh_table()
+        local_settings.update(exception_source=path)
 
     def _on_reviewer_changed(self):
+        reviewer = self.reviewer_edit.text().strip()
         if self.exception_store is not None:
-            self.exception_store.reviewer = self.reviewer_edit.text().strip()
+            self.exception_store.reviewer = reviewer
+        local_settings.update(reviewer=reviewer)
 
     def _try_autoload_exception_csv(self):
         if REPO_EXCEPTION_CSV_GUESS.exists():
             self.exception_store = ExceptionStore(REPO_EXCEPTION_CSV_GUESS, reviewer=getpass.getuser())
+
+    def _try_load_local_settings(self):
+        """이 컴퓨터에서 이전에 수동으로 지정해뒀던 경로들을 불러온다.
+        (NAS 마운트 위치는 컴퓨터마다 달라서 dataset.json 자동추측보다 우선한다)
+        """
+        settings = local_settings.load()
+        if not settings:
+            return
+
+        if settings.get("dataset_root"):
+            p = Path(settings["dataset_root"])
+            if p.exists():
+                self.dataset_root = p
+        if settings.get("keyframe_images_dir"):
+            p = Path(settings["keyframe_images_dir"])
+            if p.exists():
+                self.keyframe_images_dir = p
+        if settings.get("exception_source"):
+            p = Path(settings["exception_source"])
+            if p.exists():
+                self.exception_store = ExceptionStore(p, reviewer=settings.get("reviewer", "") or getpass.getuser())
+        if settings.get("reviewer"):
+            self.reviewer_edit.setText(settings["reviewer"])
+        if settings.get("metadata_path") and not self.entries:
+            p = Path(settings["metadata_path"])
+            if p.exists():
+                try:
+                    self.entries = load_dataset(p)
+                    self.entry_by_origin = {e.origin_no: e for e in self.entries}
+                    self.meta_label.setText(f"{p.name} ({len(self.entries)}개 항목, 이전 설정 기억)")
+                    self._refresh_table()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        self._update_source_status_label()
 
     def _try_autoload_dataset_config(self):
         """tools/tagging/config/dataset.json 을 읽어 NAS 경로들을 자동으로 채운다.
@@ -362,20 +405,30 @@ class MainWindow(QMainWindow):
         exception_*.csv / exception_history_*.csv 는 dataset_root와 같은 폴더에
         검토자별로 흩어져 있으므로, dataset_root가 마운트되면 그 폴더를
         예외처리 디렉토리로 자동 지정한다(단, 사용자가 이미 다른 소스를 지정했으면 덮어쓰지 않음).
+        로컬에 저장된 이전 지정값이 있으면 그게 우선이고, 이 자동추측은 빈 곳만 채운다.
         """
         cfg = load_dataset_config(DEFAULT_CONFIG_PATH)
         if cfg is None:
             self._update_source_status_label()
             return
 
-        if cfg.dataset_root.mounted:
+        if self.dataset_root is not None:
+            pass  # 로컬 설정으로 이미 채워짐 - 자동추측으로 덮어쓰지 않음
+        elif cfg.dataset_root.mounted:
             self.dataset_root = cfg.dataset_root.resolved
             if self.exception_store is None or self.exception_store.path == REPO_EXCEPTION_CSV_GUESS:
                 self.exception_store = ExceptionStore(
                     cfg.dataset_root.resolved, reviewer=self.reviewer_edit.text().strip()
                 )
-        if cfg.handshape_image_dir.mounted:
+            # 처음으로 자동 탐색에 성공한 경로는 로컬에 저장해서, 다음 실행부터는
+            # (특히 윈도우에서 드라이브 문자 A~Z를 훑는) 재탐색 없이 바로 불러오게 한다
+            local_settings.update(
+                dataset_root=str(cfg.dataset_root.resolved),
+                exception_source=str(cfg.dataset_root.resolved),
+            )
+        if self.keyframe_images_dir is None and cfg.handshape_image_dir.mounted:
             self.keyframe_images_dir = cfg.handshape_image_dir.resolved
+            local_settings.update(keyframe_images_dir=str(cfg.handshape_image_dir.resolved))
 
         # 메타데이터가 아직 없을 때만 자동 로드 시도 (사용자가 이미 연 걸 덮어쓰지 않음)
         if not self.entries:
@@ -390,6 +443,7 @@ class MainWindow(QMainWindow):
                     self.entry_by_origin = {e.origin_no: e for e in self.entries}
                     self.meta_label.setText(f"{meta_candidate.name} ({len(self.entries)}개 항목, 자동)")
                     self._refresh_table()
+                    local_settings.update(metadata_path=str(meta_candidate))
                 except Exception:  # noqa: BLE001
                     pass
 
