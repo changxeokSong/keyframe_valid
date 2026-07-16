@@ -273,14 +273,21 @@ def validate_entry(
     session = session or requests.Session()
 
     # 1) 내 키프레임 signature 확보 - 태깅된 키프레임 '전부' (metadata keyframes 개수만큼).
-    #    우선순위: 수동 지정 이미지(항상 1개) > NAS keyframe_images 실제 사진들 > NAS 원본 비디오 프레임들
+    #    우선순위: 수동 지정 이미지(항상 1개) > NAS 원본 비디오(이 entry가 가리키는 그
+    #    특정 인스턴스/사람/subset의 실제 영상) > NAS keyframe_images.
+    #    keyframe_images는 origin_no(글로스) 단위로만 저장돼 있어서 어떤 인스턴스를
+    #    검증하든 항상 같은 "정답" 사진을 준다 - 이걸 "내 키프레임"으로 쓰면 실제로는
+    #    아무것도 검증 안 하고 정답을 정답과 비교하는 꼴이 되어 라벨 오류를 절대 못 잡는다.
+    #    그래서 인스턴스별 실제 영상(dataset_root)이 있으면 반드시 그걸 우선한다.
     if my_keyframe_image is not None:
         sig, note = extract_keyframe_from_image(my_keyframe_image, extractors)
         my_sigs = [sig] if sig is not None else []
-    elif keyframe_images_dir is not None:
-        my_sigs, note = extract_my_keyframe_signatures_from_images_dir(entry, keyframe_images_dir, extractors)
     elif dataset_root is not None:
         my_sigs, note = extract_my_keyframe_signatures_from_nas(entry, dataset_root, extractors)
+    elif keyframe_images_dir is not None:
+        my_sigs, note = extract_my_keyframe_signatures_from_images_dir(entry, keyframe_images_dir, extractors)
+        note = ("경고: dataset_root 없이 keyframe_images(글로스 공통 사진)만으로 검증 중 - "
+                "인스턴스별 실제 영상이 아니라 라벨 오류를 못 잡을 수 있음. " + note)
     else:
         my_sigs, note = [], "keyframe_images_dir/dataset_root/my_keyframe_image 모두 지정 안 됨"
 
