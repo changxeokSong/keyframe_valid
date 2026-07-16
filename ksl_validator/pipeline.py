@@ -149,9 +149,14 @@ def extract_keyframe_from_image(image_path: Path, extractors: Extractors):
 
 
 def scan_video_for_best_match(
-    video_path: Path, target_sig: Signature, extractors: Extractors, stride: int = 1
+    video_path: Path, target_sig: Signature, extractors: Extractors, stride: int = 1,
+    on_frame=None,
 ) -> tuple[Optional[float], Optional[int], bool, int]:
-    """반환: (best_score, best_frame_idx, hand_used_at_best, scanned_frame_count)"""
+    """반환: (best_score, best_frame_idx, hand_used_at_best, scanned_frame_count)
+
+    on_frame: (frame_idx, frame_ndarray, current_score_or_None) -> None
+    지정하면 스캔한 프레임마다 호출된다 (GUI에서 진행 상황을 실시간으로 보여주는 용도).
+    """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return None, None, False, 0
@@ -174,6 +179,8 @@ def scan_video_for_best_match(
                 best_idx = frame_idx
                 best_hand_used = detail["hand_used"]
             scanned += 1
+            if on_frame is not None:
+                on_frame(frame_idx, frame, score)
         frame_idx += 1
 
     cap.release()
@@ -191,6 +198,7 @@ def validate_entry(
     stride: int = 3,
     session: Optional[requests.Session] = None,
     category: str = "",
+    on_frame=None,
 ) -> ValidationResult:
     session = session or requests.Session()
 
@@ -220,7 +228,7 @@ def validate_entry(
 
     # 3) 프레임 전수 스캔하며 최고 유사 프레임 탐색
     best_score, best_idx, hand_used, scanned = scan_video_for_best_match(
-        video_path, my_sig, extractors, stride=stride
+        video_path, my_sig, extractors, stride=stride, on_frame=on_frame
     )
 
     if best_score is None:

@@ -15,8 +15,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
-import requests
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView, QCheckBox, QDoubleSpinBox, QFileDialog, QHBoxLayout,
@@ -25,7 +24,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from .. import local_settings, sldict_client
+from .. import local_settings
 from ..dataset_config import DEFAULT_CONFIG_PATH, load_dataset_config
 from ..exception_store import DEFAULT_STAGING_DIR, ExceptionStore
 from ..keyframe_images import find_keyframe_images
@@ -34,7 +33,7 @@ from ..paths import HANDSHAPE_CACHE_DIR, REVIEW_LOG_PATH, SAMPLE_EXCEPTION_CSV_P
 from ..pipeline import ValidationResult
 from ..report import build_report, DEFAULT_REPORT_MD_PATH
 from ..user_info import safe_getuser
-from .worker import ValidationWorker
+from .worker import HandshapeFetchThread, ValidationWorker
 
 IMG_W, IMG_H = 320, 240
 DEFAULT_CACHE_DIR = VIDEOS_CACHE_DIR
@@ -83,12 +82,17 @@ class MainWindow(QMainWindow):
         self.exception_store: Optional[ExceptionStore] = None
         self.cache_dir = DEFAULT_CACHE_DIR
         self.handshape_dir = DEFAULT_HANDSHAPE_DIR
-        self.http_session = requests.Session()
         self.worker: Optional[ValidationWorker] = None
         self._current_video_cap: Optional[cv2.VideoCapture] = None
         self._current_video_total = 0
         self._handshape_paths: list[Path] = []
         self._handshape_idx = 0
+        self._handshape_cache: dict[str, list[Path]] = {}  # origin_no -> paths (빈 리스트 = 확인함, 없음)
+        self._handshape_thread: Optional[HandshapeFetchThread] = None
+        self._my_kf_frames: list[np.ndarray] = []
+        self._my_kf_idx = 0
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._on_play_tick)
 
         self._init_ui()
         self._try_autoload_exception_csv()
@@ -110,9 +114,25 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 2)
         root.addWidget(splitter, 1)
 
+        root.addLayout(self._build_live_progress_row())
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setFormat("대기 중")
         root.addWidget(self.progress_bar)
+
+    def _build_live_progress_row(self) -> QHBoxLayout:
+        """검증(YOLO+MediaPipe pose 비교) 진행 중 지금 훑고 있는 프레임을 실시간으로 보여준다."""
+        row = QHBoxLayout()
+        self.live_preview_label = QLabel()
+        self.live_preview_label.setFixedSize(160, 120)
+        self.live_preview_label.setStyleSheet("background:#111; border:1px solid #ccc;")
+        self.live_preview_label.setAlignment(Qt.AlignCenter)
+        row.addWidget(self.live_preview_label)
+
+        self.live_preview_text = QLabel("검증 대기 중")
+        self.live_preview_text.setStyleSheet("color:#444;")
+        row.addWidget(self.live_preview_text, 1)
+        return row
 
     def _build_toolbar(self) -> QVBoxLayout:
         box = QVBoxLayout()
@@ -234,6 +254,16 @@ class MainWindow(QMainWindow):
         self.my_kf_label.setStyleSheet("background:#eee; border:1px solid #ccc;")
         self.my_kf_label.setAlignment(Qt.AlignCenter)
         left_box.addWidget(self.my_kf_label)
+        self.my_kf_idx_label = QLabel("키프레임: -")
+        left_box.addWidget(self.my_kf_idx_label)
+        my_kf_nav = QHBoxLayout()
+        btn_my_kf_prev = QPushButton("◀ 이전 키프레임")
+        btn_my_kf_prev.clicked.connect(lambda: self._show_my_keyframe_at(self._my_kf_idx - 1))
+        my_kf_nav.addWidget(btn_my_kf_prev)
+        btn_my_kf_next = QPushButton("다음 키프레임 ▶")
+        btn_my_kf_next.clicked.connect(lambda: self._show_my_keyframe_at(self._my_kf_idx + 1))
+        my_kf_nav.addWidget(btn_my_kf_next)
+        left_box.addLayout(my_kf_nav)
         btn_manual_kf = QPushButton("키프레임 이미지 직접 지정...")
         btn_manual_kf.clicked.connect(self._pick_manual_keyframe)
         left_box.addWidget(btn_manual_kf)
@@ -253,6 +283,14 @@ class MainWindow(QMainWindow):
         mid_box.addWidget(self.frame_slider)
         self.frame_idx_label = QLabel("프레임: -")
         mid_box.addWidget(self.frame_idx_label)
+
+        play_row = QHBoxLayout()
+        self.btn_play = QPushButton("▶ 재생")
+        self.btn_play.clicked.connect(self._toggle_play)
+        self.btn_play.setEnabled(False)
+        play_row.addWidget(self.btn_play)
+        mid_box.addLayout(play_row)
+
         btn_open_site = QPushButton("사전 사이트에서 직접 열기")
         btn_open_site.clicked.connect(self._open_in_browser)
         mid_box.addWidget(btn_open_site)
@@ -551,6 +589,7 @@ class MainWindow(QMainWindow):
         )
         self.worker.result_ready.connect(self._on_result_ready)
         self.worker.progress.connect(self._on_progress)
+        self.worker.frame_progress.connect(self._on_frame_progress)
         self.worker.finished_all.connect(self._on_validation_finished)
         self.worker.log.connect(lambda msg: QMessageBox.warning(self, "안내", msg))
 
@@ -579,11 +618,23 @@ class MainWindow(QMainWindow):
     def _on_progress(self, done: int, total: int):
         self.progress_bar.setValue(done)
 
+    def _on_frame_progress(self, origin_no: str, frame: np.ndarray, score: Optional[float]):
+        """검증 중인 프레임을 실시간으로 보여준다 (YOLO+MediaPipe가 실제로
+        사람을 잡고 있는지 눈으로 바로 확인 가능)."""
+        self.live_preview_label.setPixmap(cv2_to_pixmap(frame, size=(160, 120)))
+        gloss = self.entry_by_origin.get(origin_no)
+        gloss_name = gloss.gloss_name if gloss else ""
+        score_txt = f"{score:.4f}" if score is not None else "검출 안 됨"
+        self.live_preview_text.setText(
+            f"검증 중: origin_no={origin_no} ({gloss_name})  |  현재 프레임 유사도: {score_txt}"
+        )
+
     def _on_validation_finished(self):
         self.btn_validate_all.setEnabled(True)
         self.btn_validate_selected.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.progress_bar.setFormat("완료")
+        self.live_preview_text.setText("검증 완료")
 
     # ── 상세 패널 ──────────────────────────────────────────────────────
     def _on_row_selected(self):
@@ -592,6 +643,8 @@ class MainWindow(QMainWindow):
             self._show_detail_for(entry)
 
     def _release_current_cap(self):
+        self._play_timer.stop()
+        self.btn_play.setText("▶ 재생")
         if self._current_video_cap is not None:
             self._current_video_cap.release()
             self._current_video_cap = None
@@ -601,13 +654,14 @@ class MainWindow(QMainWindow):
         result = self.results.get(entry.origin_no)
         is_exc = self.exception_store.is_exception(entry.origin_no) if self.exception_store else False
 
-        # 내 키프레임 표시
-        my_frame = self._load_my_keyframe_frame(entry)
-        if my_frame is not None:
-            self.my_kf_label.setPixmap(cv2_to_pixmap(my_frame))
+        # 내 키프레임 표시 (여러 개면 이전/다음으로 넘겨볼 수 있음)
+        self._my_kf_frames = self._load_my_keyframe_candidates(entry)
+        self._my_kf_idx = 0
+        if self._my_kf_frames:
+            self._show_my_keyframe_at(0)
         else:
             self.my_kf_label.setText("(키프레임 없음 - NAS 미마운트\n또는 직접 지정 필요)")
-            self.my_kf_label.setPixmap(QPixmap())
+            self.my_kf_idx_label.setText("키프레임: -")
 
         # 사전 사이트 프레임 표시 + 슬라이더 세팅
         if result and result.video_path and Path(result.video_path).exists():
@@ -618,7 +672,9 @@ class MainWindow(QMainWindow):
             self.frame_slider.setValue(result.best_frame_idx or 0)
             self.frame_slider.blockSignals(False)
             self._show_video_frame(result.best_frame_idx or 0)
+            self.btn_play.setEnabled(True)
         else:
+            self.btn_play.setEnabled(False)
             self.site_frame_label.setText("(아직 검증 안 됨)")
             self.site_frame_label.setPixmap(QPixmap())
             self.frame_slider.setRange(0, 0)
@@ -659,48 +715,107 @@ class MainWindow(QMainWindow):
         self.btn_restore.setEnabled(is_exc)
         self.btn_mark_exception.setEnabled(not is_exc)
 
-    def _load_my_keyframe_frame(self, entry: DatasetEntry) -> Optional[np.ndarray]:
-        """'내 키프레임' 표시용 원본 프레임 로드. 우선순위:
-        수동 지정 이미지 > NAS keyframe_images 실제 사진 > NAS 원본 비디오 프레임 탐색
-        (pipeline.validate_entry 와 동일한 우선순위를 사용해 화면과 채점이 일치하게 한다)
+    def _load_my_keyframe_candidates(self, entry: DatasetEntry) -> list[np.ndarray]:
+        """'내 키프레임'으로 볼 수 있는 프레임들을 전부 모아서 반환 (여러 개면
+        이전/다음 버튼으로 넘겨볼 수 있게). 우선순위:
+        수동 지정 이미지 > NAS keyframe_images 실제 사진(여러 장 가능) >
+        NAS 원본 비디오의 태깅된 키프레임 인덱스들(여러 개 가능)
+        (자동 채점 pipeline.validate_entry는 이 중 첫 번째만 쓴다 - 화면은 전체를 보여줌)
         """
         override = self.manual_keyframe.get(entry.origin_no)
         if override is not None:
             frame = cv2.imread(str(override))
             if frame is not None:
-                return frame
+                return [frame]
 
         if self.keyframe_images_dir is not None:
             matches = find_keyframe_images(self.keyframe_images_dir, entry.origin_no)
-            if matches:
-                frame = cv2.imread(str(matches[0]))
+            frames = []
+            for m in matches:
+                frame = cv2.imread(str(m))
                 if frame is not None:
-                    return frame
+                    frames.append(frame)
+            if frames:
+                return frames
 
         if self.dataset_root is not None and entry.video_rel_path and entry.keyframes:
             video_path = self.dataset_root / entry.video_rel_path
             if video_path.exists():
                 cap = cv2.VideoCapture(str(video_path))
-                cap.set(cv2.CAP_PROP_POS_FRAMES, entry.keyframes[0])
-                ret, frame = cap.read()
+                frames = []
+                for kf_idx in entry.keyframes:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, kf_idx)
+                    ret, frame = cap.read()
+                    if ret:
+                        frames.append(frame)
                 cap.release()
-                if ret:
-                    return frame
-        return None
+                if frames:
+                    return frames
+        return []
+
+    def _show_my_keyframe_at(self, idx: int):
+        if not self._my_kf_frames:
+            return
+        idx = idx % len(self._my_kf_frames)
+        self._my_kf_idx = idx
+        self.my_kf_label.setPixmap(cv2_to_pixmap(self._my_kf_frames[idx]))
+        self.my_kf_idx_label.setText(f"키프레임: {idx + 1}/{len(self._my_kf_frames)}")
 
     def _load_handshape_images(self, entry: DatasetEntry):
-        """사전 사이트의 '수형 사진'(일러스트) 로드. 참고용이며 자동 채점엔 안 씀."""
+        """사전 사이트의 '수형 사진'(일러스트) 로드. 참고용이며 자동 채점엔 안 씀.
+
+        origin_no마다 매번 네트워크로 다시 긁어오면 행을 클릭할 때마다 렉이 걸리므로,
+        메모리 캐시 -> 디스크 캐시 -> (그래도 없으면) 백그라운드 스레드로 네트워크 요청
+        순서로 확인한다. UI 스레드를 절대 막지 않는다.
+        """
         self._handshape_paths = []
         self._handshape_idx = 0
-        try:
-            self._handshape_paths = sldict_client.download_handshape_images(
-                self.http_session, entry.origin_no, self.handshape_dir
-            )
-        except Exception as e:  # noqa: BLE001 - 오프라인/사이트 오류 시 조용히 비워둠
-            self.handshape_label.setText(f"(불러오기 실패)\n{e}")
-            self.handshape_label.setPixmap(QPixmap())
+        origin_no = entry.origin_no
+
+        # 1) 메모리 캐시 (이미 이번 세션에 한 번이라도 확인했으면 즉시 표시)
+        if origin_no in self._handshape_cache:
+            self._handshape_paths = self._handshape_cache[origin_no]
+            self._display_handshape_result()
             return
 
+        # 2) 디스크 캐시 (이전 실행에서 이미 받아둔 파일이 있으면 네트워크 요청 자체를 생략)
+        cached = sorted(self.handshape_dir.glob(f"{origin_no}_*.jpg")) if self.handshape_dir.exists() else []
+        if cached:
+            self._handshape_cache[origin_no] = cached
+            self._handshape_paths = cached
+            self._display_handshape_result()
+            return
+
+        # 3) 진짜 처음 보는 항목 -> 백그라운드 스레드로 네트워크 요청 (UI 안 멈춤)
+        # setText()가 이전 pixmap을 알아서 지우므로 setPixmap(QPixmap())을 따로 부르지 않는다
+        # (부르면 방금 설정한 텍스트가 바로 지워짐)
+        self.handshape_label.setText("(불러오는 중...)")
+
+        if self._handshape_thread is not None and self._handshape_thread.isRunning():
+            self._handshape_thread.wait(0)  # 이전 요청 결과는 무시(콜백에서 origin_no로 걸러짐)
+
+        self._handshape_thread = HandshapeFetchThread(origin_no, self.handshape_dir)
+        self._handshape_thread.fetched.connect(self._on_handshape_fetched)
+        self._handshape_thread.failed.connect(self._on_handshape_failed)
+        self._handshape_thread.start()
+
+    def _on_handshape_fetched(self, origin_no: str, paths: list):
+        self._handshape_cache[origin_no] = paths
+        entry = self._selected_entry()
+        if entry is None or entry.origin_no != origin_no:
+            return  # 그 사이에 사용자가 다른 행을 클릭함 - 지금 화면과 무관
+        self._handshape_paths = paths
+        self._display_handshape_result()
+
+    def _on_handshape_failed(self, origin_no: str, error: str):
+        self._handshape_cache[origin_no] = []
+        entry = self._selected_entry()
+        if entry is None or entry.origin_no != origin_no:
+            return
+        self.handshape_label.setText(f"(불러오기 실패)\n{error}")
+        self.handshape_label.setPixmap(QPixmap())
+
+    def _display_handshape_result(self):
         if not self._handshape_paths:
             self.handshape_label.setText("(참고 이미지 없음)")
             self.handshape_label.setPixmap(QPixmap())
@@ -734,6 +849,28 @@ class MainWindow(QMainWindow):
         if ret:
             self.site_frame_label.setPixmap(cv2_to_pixmap(frame))
         self.frame_idx_label.setText(f"프레임: {idx} / {self._current_video_total - 1}")
+
+    def _toggle_play(self):
+        if self._play_timer.isActive():
+            self._play_timer.stop()
+            self.btn_play.setText("▶ 재생")
+            return
+        if self._current_video_cap is None:
+            return
+        fps = self._current_video_cap.get(cv2.CAP_PROP_FPS) or 30.0
+        interval_ms = max(1, int(1000 / fps))
+        if self.frame_slider.value() >= self._current_video_total - 1:
+            self.frame_slider.setValue(0)  # 끝까지 봤으면 처음부터 다시 재생
+        self._play_timer.start(interval_ms)
+        self.btn_play.setText("⏸ 정지")
+
+    def _on_play_tick(self):
+        next_idx = self.frame_slider.value() + 1
+        if next_idx > self._current_video_total - 1:
+            self._play_timer.stop()
+            self.btn_play.setText("▶ 재생")
+            return
+        self.frame_slider.setValue(next_idx)  # valueChanged가 _on_slider_moved를 호출해 화면 갱신
 
     # ── 리뷰 액션 ──────────────────────────────────────────────────────
     def _confirm_ok(self):
@@ -865,4 +1002,6 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait(2000)
+        if self._handshape_thread and self._handshape_thread.isRunning():
+            self._handshape_thread.wait(2000)
         super().closeEvent(event)
