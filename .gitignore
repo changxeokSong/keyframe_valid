@@ -1,0 +1,21 @@
+# 별도 프로젝트 (자체 .git 보유, 이 저장소에는 포함하지 않음)
+online-sign-keyframe-detection-transformers/
+*.rar
+
+# 다운로드 캐시 (재생성 가능, 용량 큼)
+cache/
+
+# 가상환경
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+
+# Claude Code 로컬 세션 설정 (머신별 권한 승인 상태, 프로젝트 소스 아님)
+.claude/

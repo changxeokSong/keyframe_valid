@@ -1,0 +1,9 @@
+requests
+beautifulsoup4
+opencv-python
+numpy
+openpyxl
+ultralytics
+mediapipe
+PyQt5
+tqdm
