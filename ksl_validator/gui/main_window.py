@@ -564,7 +564,7 @@ class MainWindow(QMainWindow):
         note = result.note if result else ""
 
         values = [
-            entry.origin_no, entry.gloss_name,
+            entry.origin_no, entry.gloss_name, entry.video_id or "",
             "예외" if is_exc else "정상", status, score, hand, frame, note,
         ]
         bg = STATUS_COLORS.get(status, STATUS_COLORS[""])
