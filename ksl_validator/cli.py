@@ -184,7 +184,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    setup_logging()
+    import logging
+    setup_logging(level=logging.DEBUG)  # 병목 디버깅용 - 세부 타이밍까지 콘솔에 다 보이게
     parser = build_parser()
     args = parser.parse_args(argv)
     args.func(args)
