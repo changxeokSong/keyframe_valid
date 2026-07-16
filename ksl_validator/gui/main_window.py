@@ -844,6 +844,23 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
 
     def _fill_row(self, row: int, entry: DatasetEntry):
+        """행 하나를 채운다. setItem을 컬럼별로 여러 번 부르는데, 정렬이 켜진 채로
+        이걸 하면 중간에(예: '기존상태'가 정상->예외로 바뀔 때) Qt가 즉시 재정렬을
+        해버려서 이 함수가 쓰려던 행 번호가 루프 도중에 바뀐다 - 그 결과 나머지
+        컬럼이 엉뚱한 행에 쓰여서 방금 수정한 행이 통째로 사라진 것처럼 보이는
+        버그가 있었다(직접 확인: 예외처리 직후 그 행이 테이블에서 안 보임).
+        _refresh_table처럼 전체를 다시 채울 때는 이미 정렬을 꺼두므로 여기서
+        또 끄고 켜면 불필요한 재정렬이 생겨 그럴 때는 건드리지 않는다."""
+        was_sorting = self.table.isSortingEnabled()
+        if was_sorting:
+            self.table.setSortingEnabled(False)
+        try:
+            self._fill_row_unsorted(row, entry)
+        finally:
+            if was_sorting:
+                self.table.setSortingEnabled(True)
+
+    def _fill_row_unsorted(self, row: int, entry: DatasetEntry):
         key = entry_key(entry)
         result = self.results.get(key)
         is_exc = self.exception_store.is_exception(entry.origin_no, entry.video_id or "") if self.exception_store else False
@@ -1311,15 +1328,28 @@ class MainWindow(QMainWindow):
         origin_no가 아니라 entry_key로 "자기 자신"만 제외한다 - 같은 글로스를 여러
         사람(video_id)이 각자 촬영한 경우 그 사람들은 origin_no가 전부 같아서,
         origin_no만으로 제외하면 정작 보여줘야 할 "다른 사람들의 정상 영상"까지
-        전부 걸러져 사라지는 버그가 있었다."""
+        전부 걸러져 사라지는 버그가 있었다.
+
+        ETRI 데이터셋 관례상 subset "004"가 기준(모범) 수어자다 - keyframe_images
+        (글로스 공통 기준사진)도 004번 사람 기준으로 만들어져 있다. 그래서 004번
+        사람의 정상 영상이 있으면 "정답"으로는 그것만 보여주고(여러 사람이 뒤섞여
+        보이면 어떤 게 진짜 기준인지 헷갈린다는 피드백), 없을 때만 다른 정상
+        사람 영상으로 대체한다."""
         this_key = entry_key(entry)
         same_gloss = self._entries_by_gloss.get(entry.gloss_name, [])
         others = [e for e in same_gloss if entry_key(e) != this_key]
+
         if self.exception_store is not None:
             normal = [e for e in others if not self.exception_store.is_exception(e.origin_no, e.video_id or "")]
-            if normal:
-                return normal
-        return others
+        else:
+            normal = others
+
+        canonical = [e for e in normal if (e.video_id or "").split("/")[0] == "004"]
+        if canonical:
+            return canonical
+        if normal:
+            return normal
+        return others  # 정상인 것도 하나도 없으면 예외 항목이라도 보여줌
 
     def _on_ref_kf_slider_moved(self, idx: int):
         if not self._ref_kf_frames:
