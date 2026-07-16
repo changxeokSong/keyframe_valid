@@ -19,10 +19,10 @@ import numpy as np
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QCheckBox, QDoubleSpinBox, QFileDialog, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QSizePolicy, QSlider, QSpinBox, QSplitter,
-    QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QDoubleSpinBox, QFileDialog,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSlider, QSpinBox,
+    QSplitter, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .. import local_settings
@@ -125,6 +125,8 @@ class MainWindow(QMainWindow):
         self._my_play_timer.timeout.connect(lambda: self._on_side_play_tick("my"))
         self._ref_play_timer = QTimer(self)
         self._ref_play_timer.timeout.connect(lambda: self._on_side_play_tick("ref"))
+        self._pending_loads: set = set()  # {"keyframe", "handshape"} - 지금 선택 로딩 중인 항목들
+        self._cursor_busy = False
 
         self._init_ui()
         self._try_autoload_exception_csv()
@@ -138,6 +140,13 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
 
         root.addLayout(self._build_toolbar())
+
+        self.selection_status_label = QLabel("")
+        self.selection_status_label.setStyleSheet(
+            "background:#fff3cd; color:#664d03; padding:4px 8px; font-weight:bold; border-radius:3px;"
+        )
+        self.selection_status_label.setVisible(False)
+        root.addWidget(self.selection_status_label)
 
         splitter = QSplitter(Qt.Vertical)
         splitter.addWidget(self._build_table())
@@ -743,6 +752,27 @@ class MainWindow(QMainWindow):
         if entry:
             self._show_detail_for(entry)
 
+    def _update_loading_indicator(self):
+        """지금 선택한 행의 데이터가 로딩 중인지 명확하게 보여준다 - 마우스 커서를
+        바쁨 상태로 바꾸고, 눈에 띄는 노란 배너에 뭘 기다리는지 적어준다.
+        (전에는 로딩 중인지 그냥 멈춘 건지 구분할 방법이 없었다는 피드백을 반영)
+        """
+        busy = bool(self._pending_loads)
+        if busy and not self._cursor_busy:
+            QApplication.setOverrideCursor(Qt.BusyCursor)
+            self._cursor_busy = True
+        elif not busy and self._cursor_busy:
+            QApplication.restoreOverrideCursor()
+            self._cursor_busy = False
+
+        if busy:
+            labels = {"keyframe": "검토대상/정답 키프레임(NAS)", "handshape": "수형사진(네트워크)"}
+            parts = [labels[k] for k in self._pending_loads if k in labels]
+            self.selection_status_label.setText(f"⏳ 불러오는 중: {', '.join(parts)}... (몇 초 걸릴 수 있어요)")
+            self.selection_status_label.setVisible(True)
+        else:
+            self.selection_status_label.setVisible(False)
+
     def _release_current_cap(self):
         self._play_timer.stop()
         self.btn_play.setText("▶ 재생")
@@ -754,6 +784,7 @@ class MainWindow(QMainWindow):
         t_total = time.perf_counter()
         log.info(f"[gui] 행 선택: origin_no={entry.origin_no} ({entry.gloss_name})")
         self._release_current_cap()
+        self._pending_loads.clear()  # 새로 선택했으니 로딩 상태를 이 항목 기준으로 다시 계산
         self.my_vs_ref_label.setText("검토대상 vs 정답 직접비교: -")
         result = self.results.get(entry.origin_no)
         is_exc = self.exception_store.is_exception(entry.origin_no) if self.exception_store else False
@@ -794,6 +825,7 @@ class MainWindow(QMainWindow):
         if my_cached is None or ref_cached is None:
             if self._kf_thread is not None and self._kf_thread.isRunning():
                 self._kf_thread.wait(0)  # 이전 요청은 그냥 흘려보냄(콜백에서 origin_no로 걸러짐)
+            self._pending_loads.add("keyframe")
             ref_entries = self._find_reference_entries(entry)
             manual_override = self.manual_keyframe.get(origin_no)
             self._kf_thread = KeyframeLoadThread(
@@ -827,6 +859,7 @@ class MainWindow(QMainWindow):
 
         # 사전 공식 참고 이미지(수형사진) - 캐시 없으면 백그라운드 스레드에서 비동기로 진행됨
         self._load_handshape_images(entry)
+        self._update_loading_indicator()
         log.info(f"[gui] 행 선택 처리 완료: {time.perf_counter() - t_total:.3f}초 (수형사진은 비동기라 미포함)")
 
         # 텍스트 요약
@@ -898,6 +931,9 @@ class MainWindow(QMainWindow):
                                      ref_frames, "(같은 글로스의 다른 정상 영상을 못 찾음)")
             self.ref_kf_source_label.setText(ref_sources[0] if ref_sources else "")
             self.btn_ref_play.setEnabled(self._ref_video_path is not None)
+        if entry.origin_no == origin_no or entry.gloss_name == gloss_name:
+            self._pending_loads.discard("keyframe")
+            self._update_loading_indicator()
 
     def _set_slider_frames(self, slider: QSlider, img_label: QLabel, idx_label: QLabel,
                             frames: list, empty_text: str):
@@ -1050,6 +1086,8 @@ class MainWindow(QMainWindow):
         if self._handshape_thread is not None and self._handshape_thread.isRunning():
             self._handshape_thread.wait(0)  # 이전 요청 결과는 무시(콜백에서 origin_no로 걸러짐)
 
+        self._pending_loads.add("handshape")
+        self._update_loading_indicator()
         self._handshape_thread = HandshapeFetchThread(origin_no, self.handshape_dir)
         self._handshape_thread.fetched.connect(self._on_handshape_fetched)
         self._handshape_thread.failed.connect(self._on_handshape_failed)
@@ -1062,6 +1100,8 @@ class MainWindow(QMainWindow):
             return  # 그 사이에 사용자가 다른 행을 클릭함 - 지금 화면과 무관
         self._handshape_paths = paths
         self._display_handshape_result()
+        self._pending_loads.discard("handshape")
+        self._update_loading_indicator()
 
     def _on_handshape_failed(self, origin_no: str, error: str):
         self._handshape_cache[origin_no] = []
@@ -1070,6 +1110,8 @@ class MainWindow(QMainWindow):
             return
         self.handshape_label.setText(f"(불러오기 실패)\n{error}")
         self.handshape_label.setPixmap(QPixmap())
+        self._pending_loads.discard("handshape")
+        self._update_loading_indicator()
 
     def _display_handshape_result(self):
         frames = []
@@ -1097,8 +1139,13 @@ class MainWindow(QMainWindow):
         self._current_video_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = self._current_video_cap.read()
         if ret:
-            # 포즈 표시 체크박스 켰을 때만 오버레이 비용이 붙는다 - 기본(꺼짐)은 그대로 빠름
-            self._display_frame(self.site_frame_label, frame)
+            if self._play_timer.isActive():
+                # 재생 중엔 매 프레임 pose 추론을 돌리면 사실상 재생이 멈춘 것처럼
+                # 느려지므로(직접 확인됨), 재생 중에는 오버레이를 건너뛴다.
+                # 슬라이더로 멈춰서 보는 동안에는(아래 다른 호출 경로) 그대로 적용된다.
+                self.site_frame_label.setPixmap(cv2_to_pixmap(frame))
+            else:
+                self._display_frame(self.site_frame_label, frame)
         star = " ⭐ 최고매칭 프레임" if self._best_match_idx is not None and idx == self._best_match_idx else ""
         self.frame_idx_label.setText(f"프레임: {idx} / {self._current_video_total - 1}{star}")
 
@@ -1165,7 +1212,8 @@ class MainWindow(QMainWindow):
         if not ret:
             self._stop_side_play(which)  # 끝까지 재생함 - 정지하고 마지막 프레임 유지
             return
-        self._display_frame(w["label"], frame)
+        # 재생 중엔 오버레이(pose 추론)를 건너뛴다 - 매 프레임 추론하면 재생이 멈춘듯 느려짐
+        w["label"].setPixmap(cv2_to_pixmap(frame))
 
     def _stop_side_play(self, which: str):
         w = self._side_widgets(which)
@@ -1314,6 +1362,9 @@ class MainWindow(QMainWindow):
             webbrowser.open(out_path.resolve().as_uri())
 
     def closeEvent(self, event):
+        if self._cursor_busy:
+            QApplication.restoreOverrideCursor()
+            self._cursor_busy = False
         self._release_current_cap()
         self._stop_side_play("my")
         self._stop_side_play("ref")

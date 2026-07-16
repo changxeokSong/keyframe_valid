@@ -26,6 +26,9 @@ rem 콘솔 코드페이지를 바꿔도 파이썬 자체 stdout/stderr 인코딩
 rem 한글 출력에서 에러가 날 수 있어 명시적으로 UTF-8을 강제한다
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
+rem Windows 콘솔에서 로그가 바로 안 뜨고 Enter를 눌러야 몰아서 나오는 현상 방지
+rem (파이썬 stdout이 버퍼링되는 문제 - 완전 unbuffered로 강제)
+set "PYTHONUNBUFFERED=1"
 
 if "%~1"=="-h" goto :usage
 if "%~1"=="--help" goto :usage

@@ -12,6 +12,9 @@
 
 set -euo pipefail
 
+# 콘솔에 로그가 바로 안 뜨고 몰아서 나오는 버퍼링 현상 방지
+export PYTHONUNBUFFERED=1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
