@@ -38,7 +38,11 @@ class DatasetPaths:
 
 
 def _unc_candidates(unc_or_path: str) -> list[Path]:
-    """UNC(\\\\server\\share\\...) 또는 //server/share/... 경로를 Mac 마운트 후보들로 변환."""
+    """UNC(\\\\server\\share\\...) 또는 //server/share/... 경로를,
+    Mac(/Volumes)/Linux(/media, /mnt)에서 흔히 쓰는 마운트 위치 후보들로 변환.
+    Windows에서는 UNC 경로가 보통 그대로 동작하므로(resolve_path의 direct 체크가
+    먼저 시도됨) 이 후보들은 주로 Mac/Linux에서만 의미가 있다.
+    """
     if not unc_or_path:
         return []
 
@@ -52,10 +56,13 @@ def _unc_candidates(unc_or_path: str) -> list[Path]:
     rest = parts[1:]
 
     candidates = [
-        Path("/Volumes", *rest),                 # /Volumes/nfs_shared/abd/...
-        Path("/Volumes", server, *rest),          # /Volumes/mldisk2/nfs_shared/abd/...
-        Path("/media/mmlab", *rest),              # 사용자가 실제 언급한 리눅스 마운트 경로 계열
-        Path("/", *rest),                         # 이미 절대경로로 마운트된 경우
+        Path("/Volumes", *rest),                  # macOS: /Volumes/nfs_shared/abd/...
+        Path("/Volumes", server, *rest),           # macOS: /Volumes/mldisk2/nfs_shared/abd/...
+        Path("/media/mmlab", *rest),               # 사용자가 실제 언급한 리눅스 마운트 경로 계열
+        Path("/media", server, *rest),             # Linux 일반: /media/mldisk2/nfs_shared/...
+        Path("/mnt", *rest),                        # Linux 일반: /mnt/nfs_shared/abd/...
+        Path("/mnt", server, *rest),                # Linux 일반: /mnt/mldisk2/nfs_shared/...
+        Path("/", *rest),                           # 이미 절대경로로 마운트된 경우
     ]
     return candidates
 

@@ -108,11 +108,31 @@ def cmd_validate(args: argparse.Namespace) -> None:
 
 
 def cmd_gui(args: argparse.Namespace) -> None:
-    from PyQt5.QtWidgets import QApplication
+    try:
+        from PyQt5.QtWidgets import QApplication
+    except ImportError as e:
+        print(f"PyQt5 로드 실패: {e}", file=sys.stderr)
+        print(
+            "Linux(우분투 등)에서는 PyQt5가 pip만으로는 부족하고 시스템 Qt 라이브러리가 "
+            "추가로 필요할 수 있습니다. 예:\n"
+            "  sudo apt install libxcb-cursor0 libxcb-xinerama0 libgl1\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     from .gui.main_window import MainWindow
 
-    app = QApplication(sys.argv[:1])
+    try:
+        app = QApplication(sys.argv[:1])
+    except Exception as e:  # noqa: BLE001 - Qt 플랫폼 플러그인 로드 실패 등
+        print(f"GUI 초기화 실패: {e}", file=sys.stderr)
+        print(
+            "Linux 서버/원격 환경이면 디스플레이(DISPLAY)가 없거나 xcb 플랫폼 플러그인이 "
+            "빠져있을 수 있습니다. 데스크톱 환경에서 실행 중인지 확인하세요.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
