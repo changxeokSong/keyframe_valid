@@ -20,9 +20,9 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView, QCheckBox, QDoubleSpinBox, QFileDialog, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-    QPushButton, QSizePolicy, QSlider, QSpinBox, QSplitter, QTableWidget,
-    QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+    QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QProgressBar, QPushButton, QSizePolicy, QSlider, QSpinBox, QSplitter,
+    QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .. import local_settings
@@ -832,7 +832,13 @@ class MainWindow(QMainWindow):
         # 텍스트 요약
         if is_exc:
             reviewers = self.exception_store.get_all_reviewers(entry.origin_no)
-            exc_desc = "예외 (" + "; ".join(f"{rev}: {row.moved_at}" for rev, row in reviewers) + ")"
+            parts = []
+            for rev, row in reviewers:
+                p = f"{rev}: {row.moved_at}"
+                if row.reason:
+                    p += f" — 사유: {row.reason}"
+                parts.append(p)
+            exc_desc = "예외 (" + "; ".join(parts) + ")"
         else:
             exc_desc = "정상"
         lines = [
@@ -1200,6 +1206,16 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "안내", f"선택한 {len(entries)}개 항목 모두 이미 예외처리되어 있습니다 (중복 방지로 건너뜀).")
             return
 
+        names = ", ".join(f"{e.gloss_name}({e.origin_no})" for e in targets[:5])
+        if len(targets) > 5:
+            names += f" 외 {len(targets) - 5}개"
+        reason, ok = QInputDialog.getMultiLineText(
+            self, "예외처리 사유",
+            f"{names}\n왜 예외처리 하는지 사유를 적어주세요 (나중에 검토할 때 참고됩니다):",
+        )
+        if not ok:
+            return
+
         msg = f"{len(targets)}개 항목을 라벨 불일치로 예외처리 하시겠습니까?"
         if already:
             msg += f"\n(이미 예외처리된 {len(already)}개는 중복이라 건너뜁니다)"
@@ -1208,8 +1224,10 @@ class MainWindow(QMainWindow):
             return
 
         for entry in targets:
-            self.exception_store.mark_exception(entry.origin_no, entry.gloss_name, entry.video_id or "")
-            self._append_review_log(entry, "EXCEPTION")
+            self.exception_store.mark_exception(
+                entry.origin_no, entry.gloss_name, entry.video_id or "", reason=reason.strip()
+            )
+            self._append_review_log(entry, "EXCEPTION", reason.strip())
             self._fill_row_by_origin(entry.origin_no)
 
         sel = self._selected_entry()
@@ -1253,17 +1271,18 @@ class MainWindow(QMainWindow):
         if row is not None:
             self._fill_row(row, self.entry_by_origin[origin_no])
 
-    def _append_review_log(self, entry: DatasetEntry, decision: str):
+    def _append_review_log(self, entry: DatasetEntry, decision: str, reason: str = ""):
         result = self.results.get(entry.origin_no)
         DEFAULT_REVIEW_LOG.parent.mkdir(parents=True, exist_ok=True)
         is_new = not DEFAULT_REVIEW_LOG.exists()
         with open(DEFAULT_REVIEW_LOG, "a", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             if is_new:
-                writer.writerow(["origin_no", "gloss_name", "decision", "best_score", "reviewed_at"])
+                writer.writerow(["origin_no", "gloss_name", "decision", "best_score", "reason", "reviewed_at"])
             writer.writerow([
                 entry.origin_no, entry.gloss_name, decision,
                 f"{result.best_score:.4f}" if result and result.best_score is not None else "",
+                reason,
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             ])
 

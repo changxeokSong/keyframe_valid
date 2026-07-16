@@ -29,11 +29,12 @@ from pathlib import Path
 from .paths import EXCEPTION_STAGING_DIR
 from .user_info import safe_getuser
 
-REQUIRED_FIELDS = ["video_id", "original_gloss", "original_gloss_name", "moved_at"]
+REQUIRED_FIELDS = ["video_id", "original_gloss", "original_gloss_name", "moved_at", "reason"]
 
 ORIGIN_KEYS = ("original_gloss", "origin_no")
 NAME_KEYS = ("original_gloss_name", "gloss_name")
 MOVED_AT_KEYS = ("moved_at", "timestamp", "reviewed_at")
+REASON_KEYS = ("reason", "note", "사유", "비고", "comment")
 
 DEFAULT_STAGING_DIR = EXCEPTION_STAGING_DIR
 
@@ -44,6 +45,7 @@ class ExceptionRow:
     origin_no: str
     gloss_name: str
     moved_at: str
+    reason: str = ""
     source: str = "source"  # "source"(원본, 읽기전용) | "staging"(로컬 대기중)
     raw: dict = field(default_factory=dict)
 
@@ -73,6 +75,7 @@ def _load_csv_rows(path: Path) -> tuple[dict[str, ExceptionRow], list[str]]:
                 origin_no=origin,
                 gloss_name=_first(row, NAME_KEYS),
                 moved_at=_first(row, MOVED_AT_KEYS),
+                reason=_first(row, REASON_KEYS),
                 raw=row,
             )
     return rows, fieldnames
@@ -198,6 +201,7 @@ class ExceptionStore:
                     "original_gloss": row.origin_no,
                     "original_gloss_name": row.gloss_name,
                     "moved_at": row.moved_at,
+                    "reason": row.reason,
                 })
 
     def _save_restore_requests(self) -> None:
@@ -208,28 +212,34 @@ class ExceptionStore:
             for origin, (by, at) in self._restore_requests.items():
                 writer.writerow([origin, by, at])
 
-    def _append_history(self, reviewer: str, origin_no: str, gloss_name: str, video_id: str, action: str) -> None:
+    def _append_history(self, reviewer: str, origin_no: str, gloss_name: str, video_id: str, action: str,
+                         reason: str = "") -> None:
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         hist_path = self._staging_history_path(reviewer)
         is_new = not hist_path.exists()
         with open(hist_path, "a", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             if is_new:
-                writer.writerow(["video_id", "original_gloss", "original_gloss_name", "action", "at"])
-            writer.writerow([video_id, origin_no, gloss_name, action, datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+                writer.writerow(["video_id", "original_gloss", "original_gloss_name", "action", "reason", "at"])
+            writer.writerow([
+                video_id, origin_no, gloss_name, action, reason,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ])
 
     # ── 변경 (전부 로컬 스테이징에만 기록, 원본 파일 write 없음) ─────────
-    def mark_exception(self, origin_no: str, gloss_name: str, video_id: str = "", reviewer: str | None = None) -> None:
+    def mark_exception(self, origin_no: str, gloss_name: str, video_id: str = "", reviewer: str | None = None,
+                        reason: str = "") -> None:
         reviewer = reviewer or self.reviewer
         self._staging_by_reviewer.setdefault(reviewer, {})[origin_no] = ExceptionRow(
             video_id=video_id or f"(video_id 불명, origin_no={origin_no}로 대체)",
             origin_no=origin_no,
             gloss_name=gloss_name,
             moved_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            reason=reason,
             source="staging",
         )
         self._save_staging_reviewer(reviewer)
-        self._append_history(reviewer, origin_no, gloss_name, video_id, "EXCEPTION")
+        self._append_history(reviewer, origin_no, gloss_name, video_id, "EXCEPTION", reason)
 
     def restore(self, origin_no: str, reviewer: str | None = None) -> bool:
         """로컬 스테이징에만 있던 항목이면 그냥 제거. 원본(NAS 등)에 있던 항목이면

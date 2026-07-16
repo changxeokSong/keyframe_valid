@@ -92,9 +92,10 @@ def build_report(
     if exceptions_this_session:
         lines.append("## 이번 세션에서 새로 예외처리한 항목")
         for row in exceptions_this_session:
+            reason_txt = f", 사유: {row['reason']}" if row.get("reason") else ""
             lines.append(
                 f"- origin_no={row['origin_no']} ({row['gloss_name']}), "
-                f"점수={row['best_score'] or '-'}, 시각={row['reviewed_at']}"
+                f"점수={row['best_score'] or '-'}, 시각={row['reviewed_at']}{reason_txt}"
             )
         lines.append("")
 
