@@ -69,8 +69,8 @@ def build_report(
     if suspects:
         lines.append("## ⚠ 라벨 불일치 의심(SUSPECT) — 점수 낮은 순(검토 우선순위)")
         lines.append("")
-        lines.append("| origin_no | gloss_name | 점수 | 손모양반영 | 최고매칭프레임 | 비고 |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("| origin_no | gloss_name | 점수 | 키프레임매칭 | 손모양반영 | 최고매칭프레임 | 비고 |")
+        lines.append("|---|---|---|---|---|---|---|")
 
         def score_of(e: DatasetEntry) -> float:
             r = results.get(e.origin_no)
@@ -81,6 +81,7 @@ def build_report(
             score_txt = f"{r.best_score:.4f}" if r.best_score is not None else "-"
             lines.append(
                 f"| {e.origin_no} | {e.gloss_name} | {score_txt} | "
+                f"{r.keyframe_matched}/{r.keyframe_total} | "
                 f"{'Y' if r.hand_used else 'N'} | {r.best_frame_idx} | {r.note} |"
             )
         lines.append("")

@@ -777,11 +777,17 @@ class MainWindow(QMainWindow):
             f"기존 예외처리 상태: {exc_desc}",
         ]
         if result:
+            per_kf = ""
+            if result.per_keyframe_scores:
+                per_kf = " (" + ", ".join(
+                    f"{s:.3f}" if s is not None else "-" for s in result.per_keyframe_scores
+                ) + ")"
             lines += [
                 "",
                 f"검증 상태: {result.status}",
                 f"최고 유사도: {result.best_score:.4f}" if result.best_score is not None else "최고 유사도: -",
                 f"최고매칭 프레임: {result.best_frame_idx}",
+                f"metadata keyframes 매칭: {result.keyframe_matched}/{result.keyframe_total}개{per_kf}",
                 f"손모양 신호 반영: {'예' if result.hand_used else '아니오 (body pose만 사용 - 신뢰도 낮음)'}",
                 f"스캔한 프레임 수: {result.frames_scanned}",
                 f"비고: {result.note}",

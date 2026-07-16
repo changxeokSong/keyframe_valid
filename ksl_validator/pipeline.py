@@ -41,7 +41,7 @@ STATUS_NO_POSE_DETECTED = "NO_POSE_DETECTED"
 
 REPORT_FIELDS = [
     "origin_no", "gloss_name", "status", "best_score", "best_frame_idx",
-    "hand_used", "frames_scanned", "video_path", "note",
+    "keyframe_matched", "keyframe_total", "hand_used", "frames_scanned", "video_path", "note",
 ]
 
 
@@ -76,6 +76,11 @@ class ValidationResult:
     frames_scanned: int = 0
     video_path: Optional[str] = None
     note: str = ""
+    # metadata에 태깅된 키프레임이 여러 개일 때, 그 각각이 사전 동영상에서
+    # 얼마나 잘 매칭됐는지 개수로 집계 (예: 3개 중 2개 매칭)
+    keyframe_total: int = 0
+    keyframe_matched: int = 0
+    per_keyframe_scores: list = field(default_factory=list)
 
     def as_row(self) -> dict:
         return {
@@ -84,6 +89,8 @@ class ValidationResult:
             "status": self.status,
             "best_score": f"{self.best_score:.4f}" if self.best_score is not None else "",
             "best_frame_idx": self.best_frame_idx if self.best_frame_idx is not None else "",
+            "keyframe_matched": self.keyframe_matched,
+            "keyframe_total": self.keyframe_total,
             "hand_used": "Y" if self.hand_used else "N",
             "frames_scanned": self.frames_scanned,
             "video_path": self.video_path or "",
@@ -91,61 +98,68 @@ class ValidationResult:
         }
 
 
-def extract_my_keyframe_from_nas(
+def extract_my_keyframe_signatures_from_nas(
     entry: DatasetEntry, dataset_root: Path, extractors: Extractors
-) -> tuple[Optional[Signature], str]:
+) -> tuple[list[Signature], str]:
+    """entry.keyframes에 태깅된 프레임 인덱스 '전부'에 대해 signature를 뽑는다
+    (첫 번째만 쓰면 검증 정확도를 개수 기준으로 보고할 수 없다)."""
     if not entry.video_rel_path:
-        return None, "metadata에 video_path 없음"
+        return [], "metadata에 video_path 없음"
     if not entry.keyframes:
-        return None, "metadata에 keyframes 없음"
+        return [], "metadata에 keyframes 없음"
 
     video_path = dataset_root / entry.video_rel_path
     if not video_path.exists():
-        return None, f"NAS 비디오 없음(마운트 확인 필요): {video_path}"
+        return [], f"NAS 비디오 없음(마운트 확인 필요): {video_path}"
 
     t0 = time.perf_counter()
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        return None, f"비디오를 열 수 없음: {video_path}"
+        return [], f"비디오를 열 수 없음: {video_path}"
 
-    target_frame = entry.keyframes[0]
-    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-    ret, frame = cap.read()
+    sigs = []
+    for kf_idx in entry.keyframes:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, kf_idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        sig = extractors.signature(frame)
+        if sig.body is not None or sig.hands:
+            sigs.append(sig)
     cap.release()
-    log.debug(f"[pipeline] NAS 비디오 프레임 읽기 {video_path.name}#{target_frame}: {time.perf_counter() - t0:.3f}초")
-    if not ret:
-        return None, f"프레임 {target_frame} 읽기 실패"
+    log.debug(
+        f"[pipeline] NAS 비디오 태깅 키프레임 {len(entry.keyframes)}개 중 {len(sigs)}개 signature 추출: "
+        f"{time.perf_counter() - t0:.3f}초"
+    )
+    if not sigs:
+        return [], "태깅된 키프레임에서 사람/손 검출 실패"
+    return sigs, ""
 
-    sig = extractors.signature(frame)
-    if sig.body is None and not sig.hands:
-        return None, f"프레임 {target_frame}에서 사람/손 검출 실패"
-    return sig, ""
 
-
-def extract_my_keyframe_from_images_dir(
+def extract_my_keyframe_signatures_from_images_dir(
     entry: DatasetEntry, keyframe_images_dir: Path, extractors: Extractors
-) -> tuple[Optional[Signature], str]:
-    """NAS의 keyframe_images/{origin_no}_{gloss}_{idx}.jpg 실제 사진에서 추출.
-
-    sldict의 '수형 사진'과 달리 실제 촬영 사진이라 pose 검출이 잘 된다.
-    같은 origin_no로 여러 장 있으면 첫 번째(index=1)를 자동 채점에 사용한다.
-    """
+) -> tuple[list[Signature], str]:
+    """keyframe_images의 origin_no로 매칭되는 사진 '전부'에 대해 signature를 뽑는다."""
     t0 = time.perf_counter()
     matches = find_keyframe_images(keyframe_images_dir, entry.origin_no)
-    log.debug(f"[pipeline] NAS keyframe_images glob origin_no={entry.origin_no}: {time.perf_counter() - t0:.3f}초, {len(matches)}개")
     if not matches:
-        return None, f"keyframe_images에 origin_no={entry.origin_no} 사진 없음(NAS 마운트 확인)"
+        return [], f"keyframe_images에 origin_no={entry.origin_no} 사진 없음(NAS 마운트 확인)"
 
-    t0 = time.perf_counter()
-    frame = cv2.imread(str(matches[0]))
-    log.debug(f"[pipeline] NAS 이미지 읽기 {matches[0].name}: {time.perf_counter() - t0:.3f}초")
-    if frame is None:
-        return None, f"이미지를 읽을 수 없음: {matches[0]}"
-
-    sig = extractors.signature(frame)
-    if sig.body is None and not sig.hands:
-        return None, f"사진에서 사람/손 검출 실패: {matches[0]}"
-    return sig, ""
+    sigs = []
+    for m in matches:
+        frame = cv2.imread(str(m))
+        if frame is None:
+            continue
+        sig = extractors.signature(frame)
+        if sig.body is not None or sig.hands:
+            sigs.append(sig)
+    log.debug(
+        f"[pipeline] NAS keyframe_images {len(matches)}장 중 {len(sigs)}개 signature 추출: "
+        f"{time.perf_counter() - t0:.3f}초"
+    )
+    if not sigs:
+        return [], "사진들에서 사람/손 검출 실패"
+    return sigs, ""
 
 
 def extract_keyframe_from_image(image_path: Path, extractors: Extractors):
@@ -204,6 +218,45 @@ def scan_video_for_best_match(
     return best_score, best_idx, best_hand_used, scanned
 
 
+def scan_video_for_all_targets(
+    video_path: Path, target_sigs: list[Signature], extractors: Extractors, stride: int = 1,
+    on_frame=None,
+) -> tuple[list[tuple[Optional[float], Optional[int], bool]], int]:
+    """태깅된 키프레임 signature '전부'에 대해, 동영상을 한 번만 스캔하면서
+    각각의 최고매칭 프레임을 동시에 찾는다 (target마다 따로 스캔하면 N배
+    느려지므로 한 번의 디코딩 패스에서 전부 비교한다).
+
+    반환: ([(best_score, best_frame_idx, hand_used), ...] target_sigs와 같은 순서, scanned_frame_count)
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return [(None, None, False) for _ in target_sigs], 0
+
+    best = [[None, None, False] for _ in target_sigs]
+    frame_idx = 0
+    scanned = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_idx % stride == 0:
+            sig = extractors.signature(frame)
+            for i, target_sig in enumerate(target_sigs):
+                score, detail = combined_similarity(target_sig.body, sig.body, target_sig.hands, sig.hands)
+                if score is not None and (best[i][0] is None or score > best[i][0]):
+                    best[i][0] = score
+                    best[i][1] = frame_idx
+                    best[i][2] = detail["hand_used"]
+            scanned += 1
+            if on_frame is not None:
+                on_frame(frame_idx, frame, best[0][0] if best else None)
+        frame_idx += 1
+
+    cap.release()
+    return [tuple(b) for b in best], scanned
+
+
 def validate_entry(
     entry: DatasetEntry,
     extractors: Extractors,
@@ -219,18 +272,19 @@ def validate_entry(
 ) -> ValidationResult:
     session = session or requests.Session()
 
-    # 1) 내 키프레임 signature 확보. 우선순위:
-    #    수동 지정 이미지 > NAS keyframe_images 실제 사진 > NAS 원본 비디오 프레임 탐색
+    # 1) 내 키프레임 signature 확보 - 태깅된 키프레임 '전부' (metadata keyframes 개수만큼).
+    #    우선순위: 수동 지정 이미지(항상 1개) > NAS keyframe_images 실제 사진들 > NAS 원본 비디오 프레임들
     if my_keyframe_image is not None:
-        my_sig, note = extract_keyframe_from_image(my_keyframe_image, extractors)
+        sig, note = extract_keyframe_from_image(my_keyframe_image, extractors)
+        my_sigs = [sig] if sig is not None else []
     elif keyframe_images_dir is not None:
-        my_sig, note = extract_my_keyframe_from_images_dir(entry, keyframe_images_dir, extractors)
+        my_sigs, note = extract_my_keyframe_signatures_from_images_dir(entry, keyframe_images_dir, extractors)
     elif dataset_root is not None:
-        my_sig, note = extract_my_keyframe_from_nas(entry, dataset_root, extractors)
+        my_sigs, note = extract_my_keyframe_signatures_from_nas(entry, dataset_root, extractors)
     else:
-        my_sig, note = None, "keyframe_images_dir/dataset_root/my_keyframe_image 모두 지정 안 됨"
+        my_sigs, note = [], "keyframe_images_dir/dataset_root/my_keyframe_image 모두 지정 안 됨"
 
-    if my_sig is None:
+    if not my_sigs:
         return ValidationResult(entry.origin_no, entry.gloss_name, STATUS_NO_MY_KEYFRAME, note=note)
 
     # 2) 사전 사이트에서 동영상 다운로드
@@ -243,22 +297,36 @@ def validate_entry(
             entry.origin_no, entry.gloss_name, STATUS_DOWNLOAD_FAILED, note=str(e)
         )
 
-    # 3) 프레임 전수 스캔하며 최고 유사 프레임 탐색
-    best_score, best_idx, hand_used, scanned = scan_video_for_best_match(
-        video_path, my_sig, extractors, stride=stride, on_frame=on_frame
+    # 3) 프레임 전수 스캔하며, 태깅된 키프레임 각각의 최고 유사 프레임을 동시에 탐색
+    per_target, scanned = scan_video_for_all_targets(
+        video_path, my_sigs, extractors, stride=stride, on_frame=on_frame
     )
+    scores = [s for s, _, _ in per_target if s is not None]
 
-    if best_score is None:
+    if not scores:
         return ValidationResult(
             entry.origin_no, entry.gloss_name, STATUS_NO_POSE_DETECTED,
             frames_scanned=scanned, video_path=str(video_path),
+            keyframe_total=len(my_sigs),
         )
 
+    # 대표(headline) 점수는 태깅된 키프레임들 중 가장 잘 맞은 것 - 기존 동작과 호환
+    best_i = max(range(len(per_target)), key=lambda i: (per_target[i][0] if per_target[i][0] is not None else -1))
+    best_score, best_idx, hand_used = per_target[best_i]
+    keyframe_matched = sum(1 for s in scores if s >= threshold)
+    per_keyframe_scores = [s for s, _, _ in per_target]
+
     status = STATUS_MATCH if best_score >= threshold else STATUS_SUSPECT
+    log.info(
+        f"[pipeline] origin_no={entry.origin_no} 키프레임 매칭: "
+        f"{keyframe_matched}/{len(my_sigs)}개 (threshold={threshold})"
+    )
     return ValidationResult(
         entry.origin_no, entry.gloss_name, status,
         best_score=best_score, best_frame_idx=best_idx, hand_used=hand_used,
         frames_scanned=scanned, video_path=str(video_path),
+        keyframe_total=len(my_sigs), keyframe_matched=keyframe_matched,
+        per_keyframe_scores=per_keyframe_scores,
     )
 
 
