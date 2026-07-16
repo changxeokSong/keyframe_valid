@@ -65,6 +65,16 @@ def _row_key(origin_no: str, video_id: str) -> str:
     return f"{origin_no}#{video_id}"
 
 
+def _subset_code(video_id: str) -> str:
+    """video_id의 "/" 앞부분 = 사람/subset 코드(예: "011"). metadata.csv와
+    예외처리 CSV가 video_id 뒷부분 형식을 다르게 쓴다(직접 확인: metadata.csv는
+    "011/16.011.C", 예외처리 CSV는 "011/16.011.C.000"으로 시퀀스가 하나 더 붙음)
+    - 전체 문자열을 그대로 비교하면 같은 사람인데도 형식 차이 때문에 항상
+    불일치로 판정돼서 예외 항목이 전부 안 보이는 버그가 있었다. "누구의 영상인가"를
+    가리는 데는 앞의 사람 코드만으로 충분하므로 그것만 비교한다."""
+    return video_id.split("/")[0].strip()
+
+
 def _row_matches(row: "ExceptionRow", video_id: str) -> bool:
     """이 예외행이 조회하려는 특정 사람(video_id)의 것인지 판단.
     저장된 행에 video_id가 없으면(구버전/글로스 단위 등록) origin_no만으로 폭넓게
@@ -76,7 +86,7 @@ def _row_matches(row: "ExceptionRow", video_id: str) -> bool:
         return True
     if not video_id:
         return False
-    return row.video_id.strip() == video_id.strip()
+    return _subset_code(row.video_id) == _subset_code(video_id)
 
 
 def _load_csv_rows(path: Path) -> tuple[dict[str, ExceptionRow], list[str]]:
