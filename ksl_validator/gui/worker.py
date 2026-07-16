@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -9,7 +10,12 @@ import requests
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from .. import sldict_client
-from ..keyframe_images import load_gloss_reference_images, load_instance_keyframes, resolve_instance_video_path
+from ..keyframe_images import (
+    build_keyframe_images_index,
+    load_gloss_reference_images,
+    load_instance_keyframes,
+    resolve_instance_video_path,
+)
 from ..metadata import DatasetEntry
 from ..pipeline import Extractors, ValidationResult, validate_entry
 
@@ -157,3 +163,21 @@ class KeyframeLoadThread(QThread):
             self.entry.origin_no, my_frames, str(my_video_path) if my_video_path else "",
             self.entry.gloss_name, ref_frames, ref_sources, ref_video_paths,
         )
+
+
+class KeyframeIndexThread(QThread):
+    """keyframe_images_dir(글로스 공통 사진 폴더) 전체를 한 번 스캔해 origin_no별
+    인덱스를 만든다. 이걸 안 하면 항목을 클릭할 때마다 NAS 디렉토리 전체 목록을
+    다시 조회해야 해서 (직접 확인: 항목당 25~40초) 검토가 사실상 불가능할 정도로
+    느려진다. 폴더가 지정될 때 딱 한 번만 백그라운드로 돌리면 그 뒤로는 즉시 조회된다."""
+
+    finished_index = pyqtSignal(int, float)  # origin_no 개수, 걸린 시간(초)
+
+    def __init__(self, keyframe_images_dir: Path, parent=None):
+        super().__init__(parent)
+        self.keyframe_images_dir = keyframe_images_dir
+
+    def run(self):
+        t0 = time.perf_counter()
+        index = build_keyframe_images_index(self.keyframe_images_dir)
+        self.finished_index.emit(len(index), time.perf_counter() - t0)

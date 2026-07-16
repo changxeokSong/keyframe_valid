@@ -21,8 +21,8 @@ import numpy as np
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QDoubleSpinBox, QFileDialog,
-    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSlider, QSpinBox,
     QSplitter, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
@@ -38,9 +38,9 @@ from ..compare import combined_similarity
 from ..pipeline import Extractors
 from ..report import build_report, DEFAULT_REPORT_MD_PATH
 from ..user_info import safe_getuser
-from .worker import HandshapeFetchThread, KeyframeLoadThread, ValidationWorker
+from .worker import HandshapeFetchThread, KeyframeIndexThread, KeyframeLoadThread, ValidationWorker
 
-IMG_W, IMG_H = 320, 240
+IMG_W, IMG_H = 220, 165
 
 # YOLO COCO 17-keypoint 스켈레톤 연결선 (팔/어깨/골반/다리만 - 얼굴은 판별에 안 씀)
 BODY_EDGES = [
@@ -68,7 +68,10 @@ STATUS_COLORS = {
     "": QColor(255, 255, 255),
 }
 
-COLS = ["origin_no", "gloss_name", "video_id(subset/사람)", "기존상태", "검증상태", "점수", "손모양", "프레임", "비고"]
+COLS = [
+    "origin_no", "gloss_name", "video_id(subset/사람)", "기존상태", "검증상태",
+    "점수(최고)", "키프레임매칭", "손모양", "프레임", "비고",
+]
 
 
 def cv2_to_pixmap(frame_bgr: np.ndarray, size=(IMG_W, IMG_H)) -> QPixmap:
@@ -84,11 +87,45 @@ def placeholder_pixmap(text: str, size=(IMG_W, IMG_H)) -> QPixmap:
     return pix
 
 
+# 전체 앱에 적용하는 단순/깔끔한 톤의 flat 스타일. 이전엔 위젯마다 제각각
+# 인라인 스타일만 있고 통일된 톤이 없어서 산만해 보였다는 피드백을 반영.
+APP_STYLESHEET = """
+QMainWindow, QWidget { background: #f5f6f8; font-size: 12px; }
+QFrame#toolbar { background: #ffffff; border-bottom: 1px solid #dde1e6; }
+QFrame#card { background: #ffffff; border: 1px solid #e2e5ea; border-radius: 6px; }
+QPushButton {
+    background: #ffffff; border: 1px solid #cfd4da; border-radius: 4px;
+    padding: 5px 10px;
+}
+QPushButton:hover { background: #eef1f5; border-color: #adb5bd; }
+QPushButton:pressed { background: #e2e6ea; }
+QPushButton:disabled { color: #adb5bd; background: #f5f6f8; }
+QPushButton#primary { background: #2f6feb; border: 1px solid #2f6feb; color: white; font-weight: 600; }
+QPushButton#primary:hover { background: #1a56d6; }
+QPushButton#successBtn { background: #e9f7ef; border: 1px solid #34a853; color: #1e7e34; font-weight: 600; }
+QPushButton#successBtn:hover { background: #d4f2df; }
+QPushButton#warnBtn { background: #fdecea; border: 1px solid #d93025; color: #b3261e; font-weight: 600; }
+QPushButton#warnBtn:hover { background: #fbd9d6; }
+QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {
+    border: 1px solid #cfd4da; border-radius: 4px; padding: 3px 6px; background: white;
+}
+QTableWidget { border: 1px solid #dde1e6; gridline-color: #eceff2; background: white; }
+QHeaderView::section {
+    background: #eef1f5; border: none; border-bottom: 1px solid #dde1e6; padding: 5px; font-weight: 600;
+}
+QTextEdit { border: 1px solid #dde1e6; border-radius: 4px; background: white; }
+QSplitter::handle { background: #e2e6ea; }
+QProgressBar { border: 1px solid #cfd4da; border-radius: 4px; text-align: center; background: white; }
+QProgressBar::chunk { background: #2f6feb; }
+"""
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("KSL Validator — 한국수어사전 라벨 검증 도구")
-        self.resize(1360, 860)
+        self.setStyleSheet(APP_STYLESHEET)
+        self._size_to_screen()
 
         self.entries: list[DatasetEntry] = []
         self.entry_by_origin: dict[str, DatasetEntry] = {}
@@ -116,8 +153,10 @@ class MainWindow(QMainWindow):
         self._ref_kf_sources: list[str] = []
         self._ref_kf_video_paths: list[Optional[Path]] = []  # ref_kf_frames와 같은 길이, 후보별 영상
         self._ref_video_path: Optional[Path] = None  # 지금 슬라이더로 보고 있는 후보의 영상 (재생용)
-        self._ref_kf_cache: dict[str, tuple] = {}  # gloss_name -> (frames, sources, video_paths)
+        self._ref_kf_cache: dict[tuple, tuple] = {}  # (gloss_name, origin_no) -> (frames, sources, video_paths)
         self._kf_thread: Optional[KeyframeLoadThread] = None
+        self._kf_thread_origin: Optional[str] = None  # 지금 돌고 있는 KeyframeLoadThread가 어느 origin_no용인지
+        self._kf_index_thread: Optional[KeyframeIndexThread] = None
         self._extractors: Optional[Extractors] = None  # 지연 로딩 (첫 비교 때 한 번만 모델 로드)
         self._validating_origin_no: Optional[str] = None
         self._play_timer = QTimer(self)
@@ -136,13 +175,32 @@ class MainWindow(QMainWindow):
         self._try_load_local_settings()
         self._try_autoload_dataset_config()
 
+    def _size_to_screen(self):
+        """화면 해상도에 맞춰 창 크기를 잡는다. 고정 1360x860이던 이전 방식은
+        1366x768 같은 노트북 화면보다 커서 켜자마자 한눈에 안 들어오고 매번
+        수동으로 리사이즈해야 했다(사용자 피드백). 가용 화면의 92%/90% 이내로
+        맞추고, 너무 쪼그라들지 않게 최소 크기도 같이 둔다."""
+        min_w, min_h = 1000, 650
+        target_w, target_h = 1360, 860
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            target_w = min(target_w, int(avail.width() * 0.92))
+            target_h = min(target_h, int(avail.height() * 0.90))
+        self.setMinimumSize(min_w, min_h)
+        self.resize(max(min_w, target_w), max(min_h, target_h))
+        if screen is not None:
+            self.move(avail.center() - self.rect().center())
+
     # ── UI 구성 ────────────────────────────────────────────────────────
     def _init_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 8, 8)
+        root.setSpacing(6)
 
-        root.addLayout(self._build_toolbar())
+        root.addWidget(self._build_toolbar())
 
         self.selection_status_label = QLabel("")
         self.selection_status_label.setStyleSheet(
@@ -178,11 +236,16 @@ class MainWindow(QMainWindow):
         row.addWidget(self.live_preview_text, 1)
         return row
 
-    def _build_toolbar(self) -> QVBoxLayout:
-        box = QVBoxLayout()
+    def _build_toolbar(self) -> QFrame:
+        frame = QFrame()
+        frame.setObjectName("toolbar")
+        box = QVBoxLayout(frame)
+        box.setContentsMargins(10, 8, 10, 8)
+        box.setSpacing(6)
 
         # ── 1행: 데이터 소스 ──────────────────────────────
         row1 = QHBoxLayout()
+        row1.setSpacing(8)
 
         btn_cfg = QPushButton("설정파일(dataset.json) 자동 불러오기")
         btn_cfg.clicked.connect(self._try_autoload_dataset_config)
@@ -214,11 +277,27 @@ class MainWindow(QMainWindow):
         row1.addWidget(btn_exc)
 
         row1.addWidget(QLabel("검토자:"))
-        self.reviewer_edit = QLineEdit(safe_getuser())
-        self.reviewer_edit.setFixedWidth(90)
-        self.reviewer_edit.setToolTip("로컬 스테이징에 exception_{검토자}.csv로 기록됩니다 (원본은 안 건드림).")
-        self.reviewer_edit.editingFinished.connect(self._on_reviewer_changed)
-        row1.addWidget(self.reviewer_edit)
+        self.reviewer_combo = QComboBox()
+        self.reviewer_combo.setEditable(True)
+        self.reviewer_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.reviewer_combo.setFixedWidth(120)
+        self.reviewer_combo.addItem(safe_getuser())
+        self.reviewer_combo.setCurrentText(safe_getuser())
+        self.reviewer_combo.setToolTip(
+            "예외처리/정상확인을 로컬 스테이징에 exception_{검토자}.csv로 기록합니다 (원본은 안 건드림). "
+            "기존에 알려진 검토자 이름 중 골라도 되고 직접 입력해도 됩니다."
+        )
+        self.reviewer_combo.editTextChanged.connect(self._on_reviewer_text_changed)
+        row1.addWidget(self.reviewer_combo)
+
+        self.btn_reviewer_apply = QPushButton("적용")
+        self.btn_reviewer_apply.setToolTip("검토자 이름을 확정합니다. 이후 예외처리/정상확인 기록이 이 이름으로 저장됩니다.")
+        self.btn_reviewer_apply.clicked.connect(self._on_reviewer_apply_clicked)
+        row1.addWidget(self.btn_reviewer_apply)
+
+        self.reviewer_status_label = QLabel(f"✔ 적용됨: {safe_getuser()}")
+        self.reviewer_status_label.setStyleSheet("color:#1e7e34; font-weight:bold;")
+        row1.addWidget(self.reviewer_status_label)
 
         self.only_exceptions_cb = QCheckBox("예외 항목만 보기")
         self.only_exceptions_cb.stateChanged.connect(lambda _checked: self._refresh_table())
@@ -244,8 +323,14 @@ class MainWindow(QMainWindow):
         self.source_status_label.setWordWrap(True)
         box.addWidget(self.source_status_label)
 
+        self.kf_index_status_label = QLabel("")
+        self.kf_index_status_label.setStyleSheet("color:#0a58ca; padding:2px;")
+        self.kf_index_status_label.setVisible(False)
+        box.addWidget(self.kf_index_status_label)
+
         # ── 3행: 검증 실행 컨트롤 ──────────────────────────
         row3 = QHBoxLayout()
+        row3.setSpacing(8)
         row3.addWidget(QLabel("threshold"))
         self.threshold_spin = QDoubleSpinBox()
         self.threshold_spin.setRange(0.0, 1.0)
@@ -264,6 +349,7 @@ class MainWindow(QMainWindow):
         row3.addWidget(self.btn_validate_selected)
 
         self.btn_validate_all = QPushButton("전체 검증 실행")
+        self.btn_validate_all.setObjectName("primary")
         self.btn_validate_all.clicked.connect(lambda: self._run_validation(selected_only=False))
         row3.addWidget(self.btn_validate_all)
 
@@ -289,7 +375,7 @@ class MainWindow(QMainWindow):
         row3.addWidget(btn_quit)
 
         box.addLayout(row3)
-        return box
+        return frame
 
     def _build_table(self) -> QTableWidget:
         self.table = QTableWidget()
@@ -306,13 +392,21 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_row_selected)
         return self.table
 
-    def _build_slider_panel(self, title: str, on_slide) -> tuple[QVBoxLayout, QLabel, QSlider, QLabel]:
+    def _build_slider_panel(self, title: str, on_slide) -> tuple[QFrame, QVBoxLayout, QLabel, QSlider, QLabel]:
         """이미지/프레임이 여러 개일 수 있는 패널의 공통 뼈대.
         내 키프레임 / 기준 이미지 / 사전 동영상 / 수형사진 전부 이 슬라이더
-        패턴 하나로 통일한다 (일관된 조작감).
+        패턴 하나로 통일한다 (일관된 조작감). 카드형 QFrame으로 감싸서
+        서로 다른 패널이라는 게 시각적으로 구분되게 한다.
         """
-        box = QVBoxLayout()
-        box.addWidget(QLabel(f"<b>{title}</b>"))
+        frame = QFrame()
+        frame.setObjectName("card")
+        box = QVBoxLayout(frame)
+        box.setContentsMargins(8, 8, 8, 8)
+        box.setSpacing(4)
+
+        title_label = QLabel(f"<b>{title}</b>")
+        title_label.setWordWrap(True)
+        box.addWidget(title_label)
 
         img_label = QLabel()
         img_label.setFixedSize(IMG_W, IMG_H)
@@ -327,16 +421,19 @@ class MainWindow(QMainWindow):
         box.addWidget(slider)
 
         idx_label = QLabel("- / -")
+        idx_label.setWordWrap(True)
         box.addWidget(idx_label)
 
-        return box, img_label, slider, idx_label
+        return frame, box, img_label, slider, idx_label
 
     def _build_detail_panel(self) -> QWidget:
         panel = QWidget()
         layout = QHBoxLayout(panel)
+        layout.setSpacing(8)
+        layout.setContentsMargins(8, 8, 8, 8)
 
         # 검토 대상 키프레임 (지금 선택한 행 - 예외처리된 항목이면 그 문제의 영상 키프레임이 여기 뜸)
-        left_box, self.my_kf_label, self.my_kf_slider, self.my_kf_idx_label = self._build_slider_panel(
+        left_frame, left_box, self.my_kf_label, self.my_kf_slider, self.my_kf_idx_label = self._build_slider_panel(
             "검토 대상 키프레임 (지금 선택한 항목 — 예외처리된 항목이면 그 영상)",
             self._on_my_kf_slider_moved,
         )
@@ -349,11 +446,11 @@ class MainWindow(QMainWindow):
         btn_manual_kf.clicked.connect(self._pick_manual_keyframe)
         left_box.addWidget(btn_manual_kf)
         left_box.addStretch()
-        layout.addLayout(left_box)
+        layout.addWidget(left_frame)
 
         # 정답 기준 이미지 (같은 글로스의 다른 정상(비예외) 영상 키프레임)
-        ref_ex_box, self.ref_kf_label, self.ref_kf_slider, self.ref_kf_idx_label = self._build_slider_panel(
-            "정답 키프레임 (같은 글로스의 다른 정상 영상)", self._on_ref_kf_slider_moved
+        ref_ex_frame, ref_ex_box, self.ref_kf_label, self.ref_kf_slider, self.ref_kf_idx_label = (
+            self._build_slider_panel("정답 키프레임 (같은 글로스의 다른 정상 영상)", self._on_ref_kf_slider_moved)
         )
         self.btn_ref_play = QPushButton("▶ 이 영상 재생")
         self.btn_ref_play.setToolTip("같은 글로스의 다른 정상 영상(있으면) 전체를 재생합니다.")
@@ -373,11 +470,11 @@ class MainWindow(QMainWindow):
         btn_compare.clicked.connect(self._update_my_vs_ref_score)
         ref_ex_box.addWidget(btn_compare)
         ref_ex_box.addStretch()
-        layout.addLayout(ref_ex_box)
+        layout.addWidget(ref_ex_frame)
 
         # 사전 사이트 동영상 (최고매칭 프레임 - 재생도 가능)
-        mid_box, self.site_frame_label, self.frame_slider, self.frame_idx_label = self._build_slider_panel(
-            "사전 사이트 동영상 (최고매칭 프레임으로 이동됨)", self._on_slider_moved
+        mid_frame, mid_box, self.site_frame_label, self.frame_slider, self.frame_idx_label = (
+            self._build_slider_panel("사전 사이트 동영상 (최고매칭 프레임으로 이동됨)", self._on_slider_moved)
         )
         play_row = QHBoxLayout()
         self.btn_play = QPushButton("▶ 재생")
@@ -393,27 +490,32 @@ class MainWindow(QMainWindow):
         btn_open_site.clicked.connect(self._open_in_browser)
         mid_box.addWidget(btn_open_site)
         mid_box.addStretch()
-        layout.addLayout(mid_box)
+        layout.addWidget(mid_frame)
 
         # 사전 공식 참고 이미지 (수형사진 - 일러스트, 사람 눈으로 참고용)
-        ref_box, self.handshape_label, self.handshape_slider, self.handshape_idx_label = self._build_slider_panel(
-            "사전 공식 참고(수형사진, 일러스트)", self._on_handshape_slider_moved
+        ref_frame, ref_box, self.handshape_label, self.handshape_slider, self.handshape_idx_label = (
+            self._build_slider_panel("사전 공식 참고(수형사진, 일러스트)", self._on_handshape_slider_moved)
         )
         ref_box.addStretch()
-        layout.addLayout(ref_box)
+        layout.addWidget(ref_frame)
 
         # 점수/판정/액션
-        right_box = QVBoxLayout()
+        right_frame = QFrame()
+        right_frame.setObjectName("card")
+        right_box = QVBoxLayout(right_frame)
+        right_box.setContentsMargins(8, 8, 8, 8)
         right_box.addWidget(QLabel("<b>검증 정보 및 판정</b>"))
         self.detail_text = QTextEdit()
         self.detail_text.setReadOnly(True)
         right_box.addWidget(self.detail_text)
 
         self.btn_confirm_ok = QPushButton("✔ 정상 확인")
+        self.btn_confirm_ok.setObjectName("successBtn")
         self.btn_confirm_ok.clicked.connect(self._confirm_ok)
         right_box.addWidget(self.btn_confirm_ok)
 
         self.btn_mark_exception = QPushButton("⚠ 라벨 불일치 → 예외처리")
+        self.btn_mark_exception.setObjectName("warnBtn")
         self.btn_mark_exception.clicked.connect(self._mark_exception)
         right_box.addWidget(self.btn_mark_exception)
 
@@ -421,7 +523,7 @@ class MainWindow(QMainWindow):
         self.btn_restore.clicked.connect(self._restore_exception)
         right_box.addWidget(self.btn_restore)
 
-        layout.addLayout(right_box)
+        layout.addWidget(right_frame, 1)
         return panel
 
     # ── 파일 열기 ──────────────────────────────────────────────────────
@@ -454,6 +556,29 @@ class MainWindow(QMainWindow):
             self.keyframe_images_dir = Path(path)
             self._update_source_status_label()
             local_settings.update(keyframe_images_dir=path)
+            self._kick_off_keyframe_index_build(self.keyframe_images_dir)
+
+    def _kick_off_keyframe_index_build(self, path: Path):
+        """keyframe_images_dir이 지정될 때 딱 한 번 폴더 전체를 인덱싱해둔다.
+        안 그러면 항목 클릭마다 NAS 디렉토리 목록을 통째로 다시 조회해서
+        25~40초씩 걸린다(직접 확인됨). 세션당 한 번만 하면 되므로 백그라운드로 돌린다."""
+        if self._kf_index_thread is not None and self._kf_index_thread.isRunning():
+            return
+        self.kf_index_status_label.setText(
+            "⏳ 키프레임 사진 폴더 인덱싱 중... (최초 1회만, NAS 폴더 크기에 따라 최대 1분 정도 걸릴 수 있어요. "
+            "끝나기 전까지는 '정답' 패널 로딩이 느릴 수 있습니다)"
+        )
+        self.kf_index_status_label.setVisible(True)
+        self._kf_index_thread = KeyframeIndexThread(path)
+        self._kf_index_thread.finished_index.connect(self._on_keyframe_index_built)
+        self._kf_index_thread.start()
+
+    def _on_keyframe_index_built(self, count: int, seconds: float):
+        self.kf_index_status_label.setText(
+            f"✔ 키프레임 사진 폴더 인덱싱 완료: origin_no {count}개, {seconds:.1f}초 (이후 조회는 즉시 됩니다)"
+        )
+        log.info(f"[gui] 키프레임 사진 폴더 인덱싱 완료: {count}개, {seconds:.1f}초")
+        QTimer.singleShot(6000, lambda: self.kf_index_status_label.setVisible(False))
 
     def _open_exception_csv(self):
         """단일 파일 모드 (로컬 git 샘플 등, 검토자 구분 없는 파일 하나)."""
@@ -464,9 +589,10 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        self.exception_store = ExceptionStore(Path(path), reviewer=self.reviewer_edit.text().strip())
+        self.exception_store = ExceptionStore(Path(path), reviewer=self.reviewer_combo.currentText().strip())
         self._update_source_status_label()
         self._refresh_table()
+        self._refresh_reviewer_choices()
         local_settings.update(exception_source=path)
 
     def _open_exception_dir(self):
@@ -476,16 +602,50 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        self.exception_store = ExceptionStore(Path(path), reviewer=self.reviewer_edit.text().strip())
+        self.exception_store = ExceptionStore(Path(path), reviewer=self.reviewer_combo.currentText().strip())
         self._update_source_status_label()
         self._refresh_table()
+        self._refresh_reviewer_choices()
         local_settings.update(exception_source=path)
 
-    def _on_reviewer_changed(self):
-        reviewer = self.reviewer_edit.text().strip()
+    def _refresh_reviewer_choices(self):
+        """예외처리 원본/스테이징에서 알려진 검토자 이름들을 모아 드롭다운 후보로 채운다.
+        (이전엔 자유 입력 텍스트박스 하나뿐이라 오타/기존 검토자 이름을 몰라서 헷갈렸음)"""
+        names: set[str] = set()
+        if self.exception_store is not None:
+            names.update(self.exception_store._reviewer_files().keys())
+            if self.exception_store.staging_dir.exists():
+                for p in self.exception_store.staging_dir.glob("exception_*.csv"):
+                    if not p.stem.startswith("exception_history"):
+                        names.add(p.stem[len("exception_"):])
+        names.add(safe_getuser())
+        current = self.reviewer_combo.currentText().strip()
+        if current:
+            names.add(current)
+
+        self.reviewer_combo.blockSignals(True)
+        self.reviewer_combo.clear()
+        self.reviewer_combo.addItems(sorted(names))
+        self.reviewer_combo.setCurrentText(current or safe_getuser())
+        self.reviewer_combo.blockSignals(False)
+
+    def _on_reviewer_text_changed(self, _text: str):
+        self.reviewer_status_label.setText("● 적용 안 됨 — '적용' 버튼을 눌러주세요")
+        self.reviewer_status_label.setStyleSheet("color:#b45309; font-weight:bold;")
+
+    def _on_reviewer_apply_clicked(self):
+        reviewer = self.reviewer_combo.currentText().strip()
+        if not reviewer:
+            QMessageBox.warning(self, "검토자 이름 필요", "검토자 이름을 입력해주세요.")
+            return
         if self.exception_store is not None:
             self.exception_store.reviewer = reviewer
         local_settings.update(reviewer=reviewer)
+        self._refresh_reviewer_choices()
+        self._update_source_status_label()
+        self.reviewer_status_label.setText(f"✔ 적용됨: {reviewer}")
+        self.reviewer_status_label.setStyleSheet("color:#1e7e34; font-weight:bold;")
+        log.info(f"[gui] 검토자 적용: {reviewer}")
 
     def _try_autoload_exception_csv(self):
         if REPO_EXCEPTION_CSV_GUESS.exists():
@@ -507,12 +667,16 @@ class MainWindow(QMainWindow):
             p = Path(settings["keyframe_images_dir"])
             if p.exists():
                 self.keyframe_images_dir = p
+                self._kick_off_keyframe_index_build(p)
         if settings.get("exception_source"):
             p = Path(settings["exception_source"])
             if p.exists():
                 self.exception_store = ExceptionStore(p, reviewer=settings.get("reviewer", "") or safe_getuser())
         if settings.get("reviewer"):
-            self.reviewer_edit.setText(settings["reviewer"])
+            self.reviewer_combo.setCurrentText(settings["reviewer"])
+            self.reviewer_status_label.setText(f"✔ 적용됨: {settings['reviewer']}")
+            self.reviewer_status_label.setStyleSheet("color:#1e7e34; font-weight:bold;")
+        self._refresh_reviewer_choices()
         if settings.get("metadata_path") and not self.entries:
             p = Path(settings["metadata_path"])
             if p.exists():
@@ -545,7 +709,7 @@ class MainWindow(QMainWindow):
             self.dataset_root = cfg.dataset_root.resolved
             if self.exception_store is None or self.exception_store.path == REPO_EXCEPTION_CSV_GUESS:
                 self.exception_store = ExceptionStore(
-                    cfg.dataset_root.resolved, reviewer=self.reviewer_edit.text().strip()
+                    cfg.dataset_root.resolved, reviewer=self.reviewer_combo.currentText().strip()
                 )
             # 처음으로 자동 탐색에 성공한 경로는 로컬에 저장해서, 다음 실행부터는
             # (특히 윈도우에서 드라이브 문자 A~Z를 훑는) 재탐색 없이 바로 불러오게 한다
@@ -553,9 +717,11 @@ class MainWindow(QMainWindow):
                 dataset_root=str(cfg.dataset_root.resolved),
                 exception_source=str(cfg.dataset_root.resolved),
             )
+            self._refresh_reviewer_choices()
         if self.keyframe_images_dir is None and cfg.handshape_image_dir.mounted:
             self.keyframe_images_dir = cfg.handshape_image_dir.resolved
             local_settings.update(keyframe_images_dir=str(cfg.handshape_image_dir.resolved))
+            self._kick_off_keyframe_index_build(self.keyframe_images_dir)
 
         # 메타데이터가 아직 없을 때만 자동 로드 시도 (사용자가 이미 연 걸 덮어쓰지 않음)
         if not self.entries:
@@ -641,13 +807,14 @@ class MainWindow(QMainWindow):
 
         status = result.status if result else ""
         score = f"{result.best_score:.4f}" if result and result.best_score is not None else ""
+        kf_match = f"{result.keyframe_matched}/{result.keyframe_total}" if result and result.keyframe_total else ""
         hand = ("Y" if result.hand_used else "N") if result else ""
         frame = str(result.best_frame_idx) if result and result.best_frame_idx is not None else ""
         note = result.note if result else ""
 
         values = [
             entry.origin_no, entry.gloss_name, entry.video_id or "",
-            "예외" if is_exc else "정상", status, score, hand, frame, note,
+            "예외" if is_exc else "정상", status, score, kf_match, hand, frame, note,
         ]
         bg = STATUS_COLORS.get(status, STATUS_COLORS[""])
         if is_exc:
@@ -808,7 +975,7 @@ class MainWindow(QMainWindow):
         self._stop_side_play("my")
         self._stop_side_play("ref")
         my_cached = self._my_kf_cache.get(origin_no)
-        ref_cached = self._ref_kf_cache.get(entry.gloss_name)
+        ref_cached = self._ref_kf_cache.get((entry.gloss_name, origin_no))
 
         if my_cached is not None:
             self._my_kf_frames, my_video_str = my_cached
@@ -816,6 +983,8 @@ class MainWindow(QMainWindow):
             self._set_slider_frames(self.my_kf_slider, self.my_kf_label, self.my_kf_idx_label,
                                      self._my_kf_frames, "(이 영상 인스턴스 키프레임 없음 - NAS 데이터셋 루트\n미마운트 또는 직접 지정 필요. keyframe_images는\n글로스 공통이라 여기엔 안 씀)")
             self.btn_my_play.setEnabled(self._my_video_path is not None)
+            if self._my_kf_frames:
+                self.my_kf_idx_label.setText(self.my_kf_idx_label.text() + self._my_kf_score_suffix(0))
             log.debug(f"[gui]   내 키프레임: 캐시 사용, {len(self._my_kf_frames)}장")
         else:
             self.my_kf_label.setText("(불러오는 중... NAS 읽기라 몇 초 걸릴 수 있음)")
@@ -836,12 +1005,18 @@ class MainWindow(QMainWindow):
         else:
             self.btn_ref_play.setEnabled(False)
 
-        if my_cached is None or ref_cached is None:
-            if self._kf_thread is not None and self._kf_thread.isRunning():
-                self._kf_thread.wait(0)  # 이전 요청은 그냥 흘려보냄(콜백에서 origin_no로 걸러짐)
+        already_loading_this_row = (
+            self._kf_thread is not None and self._kf_thread.isRunning()
+            and self._kf_thread_origin == origin_no
+        )
+        if (my_cached is None or ref_cached is None) and not already_loading_this_row:
+            # 이전 요청(다른 행용)이 아직 안 끝났으면 그냥 흘려보낸다 - 그 결과가 나중에
+            # 도착해도 _on_keyframe_loaded에서 origin_no가 지금 선택과 다르면 화면에는
+            # 반영 안 하고 캐시에만 저장하므로 안전하다(엉뚱한 행에 다른 행 결과가 섞이는 것 방지).
             self._pending_loads.add("keyframe")
             ref_entries = self._find_reference_entries(entry)
             manual_override = self.manual_keyframe.get(origin_no)
+            self._kf_thread_origin = origin_no
             self._kf_thread = KeyframeLoadThread(
                 entry, ref_entries, self.keyframe_images_dir, self.dataset_root, manual_override
             )
@@ -928,7 +1103,13 @@ class MainWindow(QMainWindow):
         지금도 그 행/글로스를 보고 있으면 화면을 갱신한다(그 사이 다른 행을
         클릭했으면 화면은 안 건드리고 캐시만 채워둠)."""
         self._my_kf_cache[origin_no] = (my_frames, my_video_path or None)
-        self._ref_kf_cache[gloss_name] = (ref_frames, ref_sources, ref_video_paths)
+        # gloss_name만으로 키를 잡으면 같은 글로스의 다른 행이 빨리 연달아 선택됐을 때
+        # 서로 다른 origin_no용으로 계산된(자기 자신은 제외하고 찾은) 후보 목록이 뒤섞여
+        # "내 영상이 다른 정상 영상으로 보이는" 등의 오염이 생겼다. origin_no까지 같이
+        # 키로 써서 행마다 완전히 분리한다.
+        self._ref_kf_cache[(gloss_name, origin_no)] = (ref_frames, ref_sources, ref_video_paths)
+        if self._kf_thread_origin == origin_no:
+            self._kf_thread_origin = None
 
         entry = self._selected_entry()
         if entry is None:
@@ -939,7 +1120,9 @@ class MainWindow(QMainWindow):
             self._set_slider_frames(self.my_kf_slider, self.my_kf_label, self.my_kf_idx_label,
                                      my_frames, "(이 영상 인스턴스 키프레임 없음 - NAS 데이터셋 루트\n미마운트 또는 직접 지정 필요. keyframe_images는\n글로스 공통이라 여기엔 안 씀)")
             self.btn_my_play.setEnabled(self._my_video_path is not None)
-        if entry.gloss_name == gloss_name:
+            if my_frames:
+                self.my_kf_idx_label.setText(self.my_kf_idx_label.text() + self._my_kf_score_suffix(0))
+
             self._ref_kf_frames = ref_frames
             self._ref_kf_sources = ref_sources
             self._ref_kf_video_paths = [Path(v) if v else None for v in ref_video_paths]
@@ -948,7 +1131,7 @@ class MainWindow(QMainWindow):
             self.ref_kf_source_label.setText(ref_sources[0] if ref_sources else "")
             self._ref_video_path = self._ref_kf_video_paths[0] if self._ref_kf_video_paths else None
             self.btn_ref_play.setEnabled(self._ref_video_path is not None)
-        if entry.origin_no == origin_no or entry.gloss_name == gloss_name:
+
             self._pending_loads.discard("keyframe")
             self._update_loading_indicator()
 
@@ -1048,7 +1231,25 @@ class MainWindow(QMainWindow):
         if not self._my_kf_frames:
             return
         self._display_frame(self.my_kf_label, self._my_kf_frames[idx])
-        self.my_kf_idx_label.setText(f"{idx + 1} / {len(self._my_kf_frames)}")
+        self.my_kf_idx_label.setText(f"{idx + 1} / {len(self._my_kf_frames)}{self._my_kf_score_suffix(idx)}")
+
+    def _my_kf_score_suffix(self, idx: int) -> str:
+        """이 슬라이더 위치(태깅된 키프레임 하나)가 사전 동영상과 얼마나 비슷했는지
+        검증 결과에서 찾아 보여준다. 전에는 '최고매칭 프레임' 점수 하나만 보여서
+        태깅된 키프레임이 여러 개일 때 나머지가 얼마나 매칭됐는지 알 수 없었다."""
+        entry = self._selected_entry()
+        if entry is None:
+            return ""
+        result = self.results.get(entry.origin_no)
+        if result is None or not result.keyframe_frame_indices or idx >= len(entry.keyframes):
+            return ""
+        frame_idx = entry.keyframes[idx]
+        score_by_frame = dict(zip(result.keyframe_frame_indices, result.per_keyframe_scores))
+        score = score_by_frame.get(frame_idx)
+        if score is None:
+            return "  [검증 점수: 검출 실패]"
+        mark = "✔" if score >= self.threshold_spin.value() else "✘"
+        return f"  [검증 점수: {score:.3f} {mark}]"
 
     def _find_reference_entries(self, entry: DatasetEntry) -> list[DatasetEntry]:
         """같은 gloss_name을 가진 다른 항목들 - "정답" 예시로 쓸 후보.
@@ -1258,7 +1459,7 @@ class MainWindow(QMainWindow):
         """staging에는 항상 쓸 수 있으므로 원본(source)이 없어도(=파일이 없어도) 빈 상태로 시작 가능."""
         if self.exception_store is None:
             self.exception_store = ExceptionStore(
-                REPO_EXCEPTION_CSV_GUESS, reviewer=self.reviewer_edit.text().strip(),
+                REPO_EXCEPTION_CSV_GUESS, reviewer=self.reviewer_combo.currentText().strip(),
             )
 
     def _mark_exception(self):
@@ -1428,4 +1629,8 @@ class MainWindow(QMainWindow):
             return
         log.info("[gui] 사용자 요청으로 프로그램 재시작")
         python = sys.executable
-        os.execv(python, [python] + sys.argv)
+        # sys.argv[0]을 그대로 재실행하면(예: .../ksl_validator/__main__.py) 이 파일이
+        # "python -m ksl_validator"가 아니라 스크립트로 직접 실행된 걸로 취급돼서
+        # "from .cli import main" 같은 상대 임포트가 깨진다(직접 확인된 크래시).
+        # 항상 -m ksl_validator로 재실행해서 패키지 컨텍스트를 보존한다.
+        os.execv(python, [python, "-m", "ksl_validator"] + sys.argv[1:])

@@ -23,6 +23,54 @@ from .paths import NAS_VIDEO_CACHE_DIR
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 NAS_VIDEO_CACHE_MAX_FILES = 15  # 무제한으로 쌓이면 부담되므로 최근 것만 유지 (LRU)
 
+# keyframe_images 폴더는 보통 전체 글로스 사진이 한 폴더에(수만 장) 들어있다.
+# Path.glob("{origin_no}_*")는 매번 그 폴더 전체를 네트워크로 다시 나열해야 해서,
+# NAS에서 항목 하나 조회하는 데도 실측 25~40초씩 걸렸다(디렉토리 목록 조회 자체가
+# 병목이지 개별 파일 읽기는 아님). 그래서 폴더 전체를 한 번만 훑어 메모리에
+# origin_no -> 파일목록 인덱스를 만들어두고, 그 뒤로는 dict 조회로 즉시 끝낸다.
+_INDEX_CACHE: dict[str, dict[str, list[Path]]] = {}
+
+
+def _index_sort_key(p: Path):
+    # 파일명 끝의 _{index} 를 정수로 정렬 (문자열 정렬시 1,10,2 순서가 되는 것 방지)
+    stem = p.stem
+    tail = stem.rsplit("_", 1)[-1]
+    try:
+        return int(tail)
+    except ValueError:
+        return 0
+
+
+def build_keyframe_images_index(keyframe_images_dir: Path) -> dict[str, list[Path]]:
+    """keyframe_images_dir 전체를 한 번 스캔해서 origin_no -> 파일목록 인덱스를 만든다.
+    GUI에서 폴더가 지정될 때 백그라운드 스레드에서 한 번만 호출하면 된다
+    (worker.KeyframeIndexThread). 폴더 전체 목록 조회라 NAS에서는 최대 1분 정도
+    걸릴 수 있지만, 세션 내내 딱 한 번만 하면 되므로 매 항목 클릭마다 걸리던
+    25~40초 지연이 사라진다."""
+    keyframe_images_dir = Path(keyframe_images_dir)
+    index: dict[str, list[Path]] = {}
+    if not keyframe_images_dir.exists():
+        _INDEX_CACHE[str(keyframe_images_dir)] = index
+        return index
+
+    t0 = time.perf_counter()
+    n_files = 0
+    for p in keyframe_images_dir.iterdir():
+        if p.suffix.lower() not in IMAGE_EXTS:
+            continue
+        n_files += 1
+        origin_no = p.stem.split("_", 1)[0]
+        index.setdefault(origin_no, []).append(p)
+    for paths in index.values():
+        paths.sort(key=_index_sort_key)
+
+    log.info(
+        f"[keyframe_images] 폴더 인덱싱 완료: 파일 {n_files}개 -> origin_no {len(index)}개, "
+        f"{time.perf_counter() - t0:.1f}초"
+    )
+    _INDEX_CACHE[str(keyframe_images_dir)] = index
+    return index
+
 
 def _get_local_video_copy(nas_path: Path) -> Path:
     """NAS 동영상을 로컬(cache/nas_videos/)에 통째로 한 번 복사해두고 그 경로를 반환.
@@ -78,23 +126,17 @@ def find_keyframe_images(keyframe_images_dir: Path, origin_no: str) -> list[Path
      예: origin_no='1' 은 '1_파나마_1.jpg' 는 매칭하지만 '10_...' 은 매칭하지 않음.)
     """
     keyframe_images_dir = Path(keyframe_images_dir)
+    index = _INDEX_CACHE.get(str(keyframe_images_dir))
+    if index is not None:
+        return index.get(origin_no, [])
+
     if not keyframe_images_dir.exists():
         return []
 
     matches: list[Path] = []
     for ext in IMAGE_EXTS:
         matches.extend(keyframe_images_dir.glob(f"{origin_no}_*{ext}"))
-
-    def sort_key(p: Path):
-        # 파일명 끝의 _{index} 를 정수로 정렬 (문자열 정렬시 1,10,2 순서가 되는 것 방지)
-        stem = p.stem
-        tail = stem.rsplit("_", 1)[-1]
-        try:
-            return int(tail)
-        except ValueError:
-            return 0
-
-    return sorted(matches, key=sort_key)
+    return sorted(matches, key=_index_sort_key)
 
 
 def load_gloss_reference_images(entry, keyframe_images_dir: Optional[Path] = None) -> list[np.ndarray]:

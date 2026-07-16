@@ -41,7 +41,7 @@ STATUS_NO_POSE_DETECTED = "NO_POSE_DETECTED"
 
 REPORT_FIELDS = [
     "origin_no", "gloss_name", "status", "best_score", "best_frame_idx",
-    "keyframe_matched", "keyframe_total", "reference_score",
+    "keyframe_matched", "keyframe_total", "per_keyframe_scores", "reference_score",
     "hand_used", "frames_scanned", "video_path", "note",
 ]
 
@@ -82,6 +82,10 @@ class ValidationResult:
     keyframe_total: int = 0
     keyframe_matched: int = 0
     per_keyframe_scores: list = field(default_factory=list)
+    # per_keyframe_scores[i]가 entry.keyframes의 몇 번째 프레임 인덱스에 대응하는지
+    # (일부 태깅 프레임은 사람/손 검출 실패로 건너뛸 수 있어서 순서가 밀릴 수 있음 -
+    # GUI에서 "검토 대상 키프레임" 슬라이더 위치와 점수를 정확히 매칭시키는 용도)
+    keyframe_frame_indices: list = field(default_factory=list)
     # 두 번째 독립 신호: 내 키프레임 vs 글로스 공통 기준사진("정답", keyframe_images).
     # 사전 동영상 비교와 별개라서, 둘 다 낮으면 라벨 오류일 확률이 더 높다고 볼 수 있다.
     reference_score: Optional[float] = None
@@ -96,6 +100,9 @@ class ValidationResult:
             "best_frame_idx": self.best_frame_idx if self.best_frame_idx is not None else "",
             "keyframe_matched": self.keyframe_matched,
             "keyframe_total": self.keyframe_total,
+            "per_keyframe_scores": ",".join(
+                f"{s:.4f}" if s is not None else "-" for s in self.per_keyframe_scores
+            ),
             "reference_score": f"{self.reference_score:.4f}" if self.reference_score is not None else "",
             "hand_used": "Y" if self.hand_used else "N",
             "frames_scanned": self.frames_scanned,
@@ -106,24 +113,29 @@ class ValidationResult:
 
 def extract_my_keyframe_signatures_from_nas(
     entry: DatasetEntry, dataset_root: Path, extractors: Extractors
-) -> tuple[list[Signature], str]:
+) -> tuple[list[Signature], list[int], str]:
     """entry.keyframes에 태깅된 프레임 인덱스 '전부'에 대해 signature를 뽑는다
-    (첫 번째만 쓰면 검증 정확도를 개수 기준으로 보고할 수 없다)."""
+    (첫 번째만 쓰면 검증 정확도를 개수 기준으로 보고할 수 없다).
+
+    반환에 원본 프레임 인덱스(kf_idx) 목록도 같이 준다 - 검출 실패한 프레임은
+    건너뛰므로 sigs 순서가 entry.keyframes와 어긋날 수 있는데, GUI에서 "이 슬라이더
+    위치가 몇 번째 점수인지" 정확히 대응시키려면 원본 인덱스가 필요하다."""
     if not entry.video_rel_path:
-        return [], "metadata에 video_path 없음"
+        return [], [], "metadata에 video_path 없음"
     if not entry.keyframes:
-        return [], "metadata에 keyframes 없음"
+        return [], [], "metadata에 keyframes 없음"
 
     video_path = dataset_root / entry.video_rel_path
     if not video_path.exists():
-        return [], f"NAS 비디오 없음(마운트 확인 필요): {video_path}"
+        return [], [], f"NAS 비디오 없음(마운트 확인 필요): {video_path}"
 
     t0 = time.perf_counter()
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        return [], f"비디오를 열 수 없음: {video_path}"
+        return [], [], f"비디오를 열 수 없음: {video_path}"
 
     sigs = []
+    frame_indices = []
     for kf_idx in entry.keyframes:
         cap.set(cv2.CAP_PROP_POS_FRAMES, kf_idx)
         ret, frame = cap.read()
@@ -132,14 +144,15 @@ def extract_my_keyframe_signatures_from_nas(
         sig = extractors.signature(frame)
         if sig.body is not None or sig.hands:
             sigs.append(sig)
+            frame_indices.append(kf_idx)
     cap.release()
     log.debug(
         f"[pipeline] NAS 비디오 태깅 키프레임 {len(entry.keyframes)}개 중 {len(sigs)}개 signature 추출: "
         f"{time.perf_counter() - t0:.3f}초"
     )
     if not sigs:
-        return [], "태깅된 키프레임에서 사람/손 검출 실패"
-    return sigs, ""
+        return [], [], "태깅된 키프레임에서 사람/손 검출 실패"
+    return sigs, frame_indices, ""
 
 
 def extract_my_keyframe_signatures_from_images_dir(
@@ -285,11 +298,12 @@ def validate_entry(
     #    검증하든 항상 같은 "정답" 사진을 준다 - 이걸 "내 키프레임"으로 쓰면 실제로는
     #    아무것도 검증 안 하고 정답을 정답과 비교하는 꼴이 되어 라벨 오류를 절대 못 잡는다.
     #    그래서 인스턴스별 실제 영상(dataset_root)이 있으면 반드시 그걸 우선한다.
+    my_frame_indices: list[int] = []
     if my_keyframe_image is not None:
         sig, note = extract_keyframe_from_image(my_keyframe_image, extractors)
         my_sigs = [sig] if sig is not None else []
     elif dataset_root is not None:
-        my_sigs, note = extract_my_keyframe_signatures_from_nas(entry, dataset_root, extractors)
+        my_sigs, my_frame_indices, note = extract_my_keyframe_signatures_from_nas(entry, dataset_root, extractors)
     elif keyframe_images_dir is not None:
         my_sigs, note = extract_my_keyframe_signatures_from_images_dir(entry, keyframe_images_dir, extractors)
         note = ("경고: dataset_root 없이 keyframe_images(글로스 공통 사진)만으로 검증 중 - "
@@ -345,23 +359,27 @@ def validate_entry(
             reference_score=reference_score, reference_note=reference_note,
         )
 
-    # 대표(headline) 점수는 태깅된 키프레임들 중 가장 잘 맞은 것 - 기존 동작과 호환
+    # 대표(headline) 점수는 태깅된 키프레임들 중 가장 잘 맞은 것 (프레임 이동/표시용).
     best_i = max(range(len(per_target)), key=lambda i: (per_target[i][0] if per_target[i][0] is not None else -1))
     best_score, best_idx, hand_used = per_target[best_i]
     keyframe_matched = sum(1 for s in scores if s >= threshold)
     per_keyframe_scores = [s for s, _, _ in per_target]
 
-    status = STATUS_MATCH if best_score >= threshold else STATUS_SUSPECT
+    # 판정(MATCH/SUSPECT)은 "가장 잘 맞은 프레임 하나"가 아니라 태깅된 키프레임
+    # '전부'가 threshold를 넘겼는지로 정한다. 하나만 우연히 비슷하게 스쳐가도
+    # MATCH로 나오던 문제(사용자 피드백)를 막기 위함 - 라벨이 맞다면 태깅된
+    # 키프레임 전부가 사전 동영상 어딘가와 비슷하게 매칭돼야 자연스럽다.
+    status = STATUS_MATCH if keyframe_matched == len(my_sigs) else STATUS_SUSPECT
     log.info(
         f"[pipeline] origin_no={entry.origin_no} 키프레임 매칭: "
-        f"{keyframe_matched}/{len(my_sigs)}개 (threshold={threshold})"
+        f"{keyframe_matched}/{len(my_sigs)}개 (threshold={threshold}) -> {status}"
     )
     return ValidationResult(
         entry.origin_no, entry.gloss_name, status,
         best_score=best_score, best_frame_idx=best_idx, hand_used=hand_used,
         frames_scanned=scanned, video_path=str(video_path),
         keyframe_total=len(my_sigs), keyframe_matched=keyframe_matched,
-        per_keyframe_scores=per_keyframe_scores,
+        per_keyframe_scores=per_keyframe_scores, keyframe_frame_indices=my_frame_indices,
         reference_score=reference_score, reference_note=reference_note,
     )
 
