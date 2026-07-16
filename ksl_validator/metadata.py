@@ -86,11 +86,23 @@ def load_from_metadata_csv(csv_path: Path) -> Iterator[DatasetEntry]:
             # 별개 항목으로 남겨야 한다. 반대로 origin_no+video_id가 완전히 같은 행이
             # 여러 번 있으면(직접 확인: 사용자 데이터에서 동일 행 3연속) 소스 CSV 쪽
             # 중복이므로 첫 번째만 남긴다.
-            dedup_key = (origin, video_id or video_rel_path or name)
-            if dedup_key in seen:
-                n_dup += 1
-                continue
-            seen.add(dedup_key)
+            #
+            # video_id도 video_path도 둘 다 비어있으면 gloss_name으로 대신 묶던 적이
+            # 있었는데, 그러면 실제로는 서로 다른 사람의 행인데 사람 구분 정보만 없는
+            # 경우까지 "중복"으로 오판해서 조용히 지워버리는 위험한 버그였다(예외처리
+            # 사유가 있는 행이 로딩 단계에서 통째로 사라져 보이는 원인이었음). 구분할
+            # 확실한 신호(video_id 또는 video_path)가 없으면 절대 합치지 않는다.
+            if video_id:
+                dedup_key = (origin, "vid", video_id)
+            elif video_rel_path:
+                dedup_key = (origin, "path", video_rel_path)
+            else:
+                dedup_key = None
+            if dedup_key is not None:
+                if dedup_key in seen:
+                    n_dup += 1
+                    continue
+                seen.add(dedup_key)
             kf_str = (row.get("keyframes") or "").strip()
             keyframes = [int(t) for t in kf_str.split() if t.strip().isdigit()]
             yield DatasetEntry(
