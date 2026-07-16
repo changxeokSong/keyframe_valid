@@ -8,7 +8,6 @@ pose 비교 검증하고, 결과를 눈으로 직접 확인하면서 예외처�
 from __future__ import annotations
 
 import csv
-import getpass
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -31,17 +30,17 @@ from ..dataset_config import DEFAULT_CONFIG_PATH, load_dataset_config
 from ..exception_store import DEFAULT_STAGING_DIR, ExceptionStore
 from ..keyframe_images import find_keyframe_images
 from ..metadata import DatasetEntry, load_dataset
+from ..paths import HANDSHAPE_CACHE_DIR, REVIEW_LOG_PATH, SAMPLE_EXCEPTION_CSV_PATH, VIDEOS_CACHE_DIR
 from ..pipeline import ValidationResult
 from ..report import build_report, DEFAULT_REPORT_MD_PATH
+from ..user_info import safe_getuser
 from .worker import ValidationWorker
 
 IMG_W, IMG_H = 320, 240
-DEFAULT_CACHE_DIR = Path("cache/videos")
-DEFAULT_HANDSHAPE_DIR = Path("cache/handshape_images")
-DEFAULT_REVIEW_LOG = Path("reports/gui_review.csv")
-REPO_EXCEPTION_CSV_GUESS = Path(
-    "online-sign-keyframe-detection-transformers/tools/tagging/config/etri_ksl_db/exception_videos.csv"
-)
+DEFAULT_CACHE_DIR = VIDEOS_CACHE_DIR
+DEFAULT_HANDSHAPE_DIR = HANDSHAPE_CACHE_DIR
+DEFAULT_REVIEW_LOG = REVIEW_LOG_PATH
+REPO_EXCEPTION_CSV_GUESS = SAMPLE_EXCEPTION_CSV_PATH
 
 STATUS_COLORS = {
     "MATCH": QColor(215, 245, 215),
@@ -151,7 +150,7 @@ class MainWindow(QMainWindow):
         row1.addWidget(btn_exc)
 
         row1.addWidget(QLabel("검토자:"))
-        self.reviewer_edit = QLineEdit(getpass.getuser())
+        self.reviewer_edit = QLineEdit(safe_getuser())
         self.reviewer_edit.setFixedWidth(90)
         self.reviewer_edit.setToolTip("로컬 스테이징에 exception_{검토자}.csv로 기록됩니다 (원본은 안 건드림).")
         self.reviewer_edit.editingFinished.connect(self._on_reviewer_changed)
@@ -362,7 +361,7 @@ class MainWindow(QMainWindow):
 
     def _try_autoload_exception_csv(self):
         if REPO_EXCEPTION_CSV_GUESS.exists():
-            self.exception_store = ExceptionStore(REPO_EXCEPTION_CSV_GUESS, reviewer=getpass.getuser())
+            self.exception_store = ExceptionStore(REPO_EXCEPTION_CSV_GUESS, reviewer=safe_getuser())
 
     def _try_load_local_settings(self):
         """이 컴퓨터에서 이전에 수동으로 지정해뒀던 경로들을 불러온다.
@@ -383,7 +382,7 @@ class MainWindow(QMainWindow):
         if settings.get("exception_source"):
             p = Path(settings["exception_source"])
             if p.exists():
-                self.exception_store = ExceptionStore(p, reviewer=settings.get("reviewer", "") or getpass.getuser())
+                self.exception_store = ExceptionStore(p, reviewer=settings.get("reviewer", "") or safe_getuser())
         if settings.get("reviewer"):
             self.reviewer_edit.setText(settings["reviewer"])
         if settings.get("metadata_path") and not self.entries:

@@ -31,9 +31,10 @@ from .pipeline import (
     extract_keyframe_from_image,
 )
 from . import sldict_client
+from .paths import VALIDATION_REPORT_PATH, VIDEOS_CACHE_DIR
 
-DEFAULT_CACHE_DIR = Path("cache/videos")
-DEFAULT_REPORT_PATH = Path("reports/validation_report.csv")
+DEFAULT_CACHE_DIR = VIDEOS_CACHE_DIR
+DEFAULT_REPORT_PATH = VALIDATION_REPORT_PATH
 
 
 def cmd_fetch(args: argparse.Namespace) -> None:

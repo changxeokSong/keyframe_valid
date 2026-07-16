@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 rem ksl_validator 앱 원클릭 실행 스크립트 (Windows / run.sh의 Windows 버전).
 rem conda 가상환경 또는 python venv 중 골라서 자동으로 만들고, 의존성 설치 후 실행한다.
 rem

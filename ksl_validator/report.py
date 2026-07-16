@@ -13,9 +13,10 @@ from typing import Optional
 
 from .exception_store import ExceptionStore
 from .metadata import DatasetEntry
+from .paths import SUMMARY_REPORT_PATH
 from .pipeline import ValidationResult
 
-DEFAULT_REPORT_MD_PATH = Path("reports/summary_report.md")
+DEFAULT_REPORT_MD_PATH = SUMMARY_REPORT_PATH
 
 
 def _load_review_log(path: Path) -> list[dict]:

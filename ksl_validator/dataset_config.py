@@ -1,9 +1,16 @@
-"""tools/tagging/config/dataset.json 을 읽어 NAS 경로들을 자동으로 채운다.
+"""NAS(etri_ksl_db) 경로들을 자동으로 채운다.
 
-dataset.json에는 Windows UNC 경로(\\\\mldisk2\\nfs_shared\\...)로 적혀 있는데,
-Mac에서 같은 NAS를 SMB로 마운트하면 보통 /Volumes/<공유이름>/... 형태가 된다.
-그래서 UNC 경로를 몇 가지 흔한 Mac 마운트 위치로 변환 시도해보고,
-실제로 존재하는 경로를 찾으면 그걸 쓰고, 없으면 '미마운트' 상태로 원본 경로를 보여준다.
+tools/tagging/config/dataset.json이 있으면 거기서 원본 경로를 읽지만, 그 파일은
+online-sign-keyframe-detection-transformers/ 안에 있고 이 폴더는 keyframe_valid
+git 저장소에서 일부러 제외했다(별도 프로젝트라서). 그래서 "실행 컴퓨터"에서
+git pull만 받으면 dataset.json 자체가 없는 게 정상이고, 이 경우에도 NAS 자동탐지가
+동작해야 하므로 실제 확인된 경로들을 이 파일 안에 직접 하드코딩해뒀다(HARDCODED_NAS_PATHS).
+dataset.json이 있으면(개발 중인 컴퓨터 등) 그쪽을 우선한다.
+
+경로는 Windows UNC(\\\\mldisk2\\nfs_shared\\...)로 적혀 있는데, Mac에서 같은 NAS를
+SMB로 마운트하면 보통 /Volumes/<공유이름>/... 형태가 된다. 그래서 UNC 경로를
+몇 가지 흔한 마운트 위치 후보로 변환 시도해보고, 실제로 존재하는 경로를 찾으면
+그걸 쓰고, 없으면 '미마운트' 상태로 원본 경로를 보여준다.
 """
 
 from __future__ import annotations
@@ -15,9 +22,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-DEFAULT_CONFIG_PATH = Path(
-    "online-sign-keyframe-detection-transformers/tools/tagging/config/dataset.json"
-)
+from .paths import DATASET_JSON_PATH
+
+DEFAULT_CONFIG_PATH = DATASET_JSON_PATH
+
+# dataset.json이 없는 컴퓨터(git pull만 받은 "실행 컴퓨터")를 위한 폴백.
+# 2026-07-16 사용자가 직접 확인해준 실제 경로.
+HARDCODED_NAS_PATHS = {
+    "dataset_root": r"\\mldisk2\nfs_shared\abd\dataset\sl\etri_ksl_db",
+    "metadata_file": r"\\mldisk2\nfs_shared\abd\dataset\sl\etri_ksl_db\metadata.csv",
+    "excel_file": "//mldisk2/nfs_shared/abd/dataset/sl/etri_ksl_db/ETRI_KSL_Dictionary_r40-Renewal-3800keyframes.xlsx",
+    "handshape_image_dir": r"\\mldisk2\nfs_shared\abd\dataset\sl\etri_ksl_db\keyframe_images",
+}
 
 
 @dataclass
@@ -100,21 +116,33 @@ def resolve_path(raw: str) -> ResolvedPath:
     return ResolvedPath(raw=raw, resolved=None)
 
 
-def load_dataset_config(config_path: Path = DEFAULT_CONFIG_PATH) -> Optional[DatasetPaths]:
-    config_path = Path(config_path)
+def _load_raw_paths_from_json(config_path: Path) -> Optional[tuple[str, dict]]:
     if not config_path.exists():
         return None
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
 
     active = data.get("active")
     cfg = (data.get("configs") or {}).get(active)
     if not cfg:
         return None
+    return active, cfg
+
+
+def load_dataset_config(config_path: Path = DEFAULT_CONFIG_PATH) -> Optional[DatasetPaths]:
+    """dataset.json이 있으면 그걸 쓰고, 없으면(대부분의 "실행 컴퓨터") 이 모듈에
+    내장된 HARDCODED_NAS_PATHS를 그대로 쓴다. 둘 다 없을 때만 None."""
+    loaded = _load_raw_paths_from_json(Path(config_path))
+    if loaded is not None:
+        name, cfg = loaded
+    else:
+        name, cfg = "etri_ksl (내장 경로)", HARDCODED_NAS_PATHS
 
     return DatasetPaths(
-        name=active,
+        name=name,
         dataset_root=resolve_path(cfg.get("dataset_root", "")),
         metadata_file=resolve_path(cfg.get("metadata_file", "")),
         handshape_image_dir=resolve_path(cfg.get("handshape_image_dir", "")),
