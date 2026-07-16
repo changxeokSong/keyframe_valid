@@ -805,7 +805,7 @@ class MainWindow(QMainWindow):
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
-            webbrowser.open(f"file://{out_path.resolve()}")
+            webbrowser.open(out_path.resolve().as_uri())
 
     def closeEvent(self, event):
         self._release_current_cap()
