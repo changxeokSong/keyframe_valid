@@ -98,10 +98,26 @@ def load_from_metadata_csv(csv_path: Path) -> Iterator[DatasetEntry]:
     merged: dict[tuple, DatasetEntry] = {}
     order: list[tuple] = []
     n_merged_rows = 0
+    n_malformed = 0
 
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         for i, row in enumerate(reader):
+            # gloss_description처럼 자유 텍스트에 큰따옴표가 잘못 들어가 있으면
+            # 그 지점부터 csv 파싱이 밀려서 이후 모든 행의 컬럼이 엉뚱하게 섞일 수
+            # 있다(직접 확인: 로그에는 있다고 나온 origin_no를 실제 파일에서 검색하면
+            # 없는 사례 발생). DictReader는 헤더보다 필드가 적으면 값이 None, 많으면
+            # None 키에 나머지를 몰아넣으므로 그걸로 밀린 행을 미리 잡아낸다.
+            if None in row or any(v is None for v in row.values()):
+                n_malformed += 1
+                if n_malformed <= 5:
+                    log.warning(
+                        f"[metadata] metadata.csv {i + 2}번째 줄의 필드 개수가 헤더와 안 맞음 "
+                        f"(따옴표 처리 문제로 이 지점부터 뒤의 행이 밀렸을 수 있음) - "
+                        f"읽힌 값: gloss={row.get('gloss')!r}, video_id={row.get('video_id')!r}"
+                    )
+                continue
+
             origin = (row.get("gloss") or "").strip()  # etri_metadata_builder는 origin_no를 'gloss' 컬럼에 저장
             name = (row.get("gloss_name") or "").strip()
             if not origin or not name:
@@ -138,6 +154,11 @@ def load_from_metadata_csv(csv_path: Path) -> Iterator[DatasetEntry]:
             merged[instance_key] = entry
             order.append(instance_key)
 
+    if n_malformed:
+        log.warning(
+            f"[metadata] metadata.csv: 필드 개수가 헤더와 안 맞는 행 {n_malformed}개 발견 - "
+            f"CSV 파일이 어딘가에서 깨졌을 가능성이 있습니다(위 경고의 줄 번호 근처를 확인해보세요)"
+        )
     if n_merged_rows:
         log.info(
             f"[metadata] metadata.csv: 같은 영상(origin_no+video_id)을 가리키는 행 "
