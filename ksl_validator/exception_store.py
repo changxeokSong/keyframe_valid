@@ -231,6 +231,14 @@ class ExceptionStore:
     def is_exception(self, origin_no: str, video_id: str = "") -> bool:
         return len(self._all_reviewers_raw(origin_no, video_id)) > 0
 
+    def all_rows(self) -> list["ExceptionRow"]:
+        """원본+스테이징 통틀어 지금 알고 있는 예외처리 행 전부 (진단/디버깅용).
+        같은 origin_no+video_id가 여러 reviewer 파일에 있으면 여러 번 나올 수 있다."""
+        out: list[ExceptionRow] = []
+        for rows in self._rows_by_origin.values():
+            out.extend(row for _reviewer, row in rows)
+        return out
+
     def is_restore_requested(self, origin_no: str, video_id: str = "") -> bool:
         for v in self._restore_by_origin.get(origin_no, ()):
             if not v or not video_id or v.strip() == video_id.strip():

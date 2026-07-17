@@ -831,8 +831,29 @@ class MainWindow(QMainWindow):
     # ── 테이블 ─────────────────────────────────────────────────────────
     def _visible_entries(self) -> list[DatasetEntry]:
         if self.only_exceptions_cb.isChecked() and self.exception_store is not None:
-            return [e for e in self.entries if self.exception_store.is_exception(e.origin_no, e.video_id or "")]
+            matched = [e for e in self.entries if self.exception_store.is_exception(e.origin_no, e.video_id or "")]
+            self._log_exception_match_diagnostics(matched)
+            return matched
         return self.entries
+
+    def _log_exception_match_diagnostics(self, matched: list[DatasetEntry]):
+        """"예외 항목만 보기"가 예상보다 훨씬 적게 보일 때 바로 원인을 알 수 있게,
+        예외처리 CSV에 있는 origin_no 중 지금 불러온 메타데이터에 아예 없는 것들을
+        로그로 남긴다(사용자 확인: 505개 중 10개만 매칭됨 - 이게 video_id 형식
+        문제인지, 애초에 메타데이터에 그 글로스 자체가 없는 건지 구분하기 위함)."""
+        if self.exception_store is None:
+            return
+        exc_rows = self.exception_store.all_rows()
+        exc_origin_nos = {r.origin_no for r in exc_rows}
+        loaded_origin_nos = {e.origin_no for e in self.entries}
+        missing = exc_origin_nos - loaded_origin_nos
+        log.info(
+            f"[gui] 예외 항목 필터: 예외처리 기록 {len(exc_rows)}개(서로 다른 origin_no {len(exc_origin_nos)}개) "
+            f"중 지금 불러온 메타데이터와 매칭된 항목 {len(matched)}개. "
+            f"메타데이터에 origin_no 자체가 없는 예외 기록: {len(missing)}개"
+        )
+        if missing:
+            log.info(f"[gui]   메타데이터에 없는 origin_no 샘플(최대 10개): {sorted(missing)[:10]}")
 
     def _refresh_table(self):
         self.table.setSortingEnabled(False)
