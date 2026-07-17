@@ -838,22 +838,48 @@ class MainWindow(QMainWindow):
 
     def _log_exception_match_diagnostics(self, matched: list[DatasetEntry]):
         """"예외 항목만 보기"가 예상보다 훨씬 적게 보일 때 바로 원인을 알 수 있게,
-        예외처리 CSV에 있는 origin_no 중 지금 불러온 메타데이터에 아예 없는 것들을
-        로그로 남긴다(사용자 확인: 505개 중 10개만 매칭됨 - 이게 video_id 형식
-        문제인지, 애초에 메타데이터에 그 글로스 자체가 없는 건지 구분하기 위함)."""
+        (1) 메타데이터에 origin_no 자체가 없는 경우와 (2) origin_no는 있지만 그
+        예외가 걸린 특정 사람(subset)의 영상이 없는 경우를 구분해서 로그로 남긴다
+        (사용자 확인: origin_no는 전부 있는데도 1559개 중 9개만 매칭됨 -> (2)일
+        가능성이 높아 보여서 subset 단위까지 파고든다)."""
         if self.exception_store is None:
             return
         exc_rows = self.exception_store.all_rows()
         exc_origin_nos = {r.origin_no for r in exc_rows}
         loaded_origin_nos = {e.origin_no for e in self.entries}
-        missing = exc_origin_nos - loaded_origin_nos
+        missing_origin = exc_origin_nos - loaded_origin_nos
+
+        entries_by_origin: dict[str, list[DatasetEntry]] = {}
+        for e in self.entries:
+            entries_by_origin.setdefault(e.origin_no, []).append(e)
+
+        def subset_of(video_id: str) -> str:
+            return video_id.split("/")[0].strip() if video_id else ""
+
+        subset_mismatch = []
+        for r in exc_rows:
+            if r.origin_no in missing_origin or not r.video_id or r.video_id.startswith("(video_id 불명"):
+                continue
+            candidates = entries_by_origin.get(r.origin_no, [])
+            exc_subset = subset_of(r.video_id)
+            available = sorted({subset_of(c.video_id or "") for c in candidates})
+            if exc_subset not in available:
+                subset_mismatch.append((r.origin_no, r.video_id, exc_subset, available))
+
         log.info(
             f"[gui] 예외 항목 필터: 예외처리 기록 {len(exc_rows)}개(서로 다른 origin_no {len(exc_origin_nos)}개) "
             f"중 지금 불러온 메타데이터와 매칭된 항목 {len(matched)}개. "
-            f"메타데이터에 origin_no 자체가 없는 예외 기록: {len(missing)}개"
+            f"메타데이터에 origin_no 자체가 없는 예외 기록: {len(missing_origin)}개, "
+            f"origin_no는 있지만 그 사람(subset) 영상이 없는 예외 기록: {len(subset_mismatch)}개"
         )
-        if missing:
-            log.info(f"[gui]   메타데이터에 없는 origin_no 샘플(최대 10개): {sorted(missing)[:10]}")
+        if missing_origin:
+            log.info(f"[gui]   메타데이터에 없는 origin_no 샘플(최대 10개): {sorted(missing_origin)[:10]}")
+        if subset_mismatch:
+            for origin_no, video_id, exc_subset, available in subset_mismatch[:5]:
+                log.info(
+                    f"[gui]   예: origin_no={origin_no} 예외기록 video_id={video_id!r}(사람={exc_subset!r}) "
+                    f"- 메타데이터엔 이 글로스에 이 사람들만 있음: {available}"
+                )
 
     def _refresh_table(self):
         self.table.setSortingEnabled(False)
