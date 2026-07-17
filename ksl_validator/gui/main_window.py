@@ -22,7 +22,7 @@ import numpy as np
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
     QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSlider, QSpinBox,
     QSplitter, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
@@ -33,7 +33,7 @@ from ..dataset_config import DEFAULT_CONFIG_PATH, load_dataset_config
 from ..exception_store import DEFAULT_STAGING_DIR, ExceptionStore
 from ..logging_setup import log, log_time
 from ..metadata import DatasetEntry, entry_key, load_dataset
-from ..paths import HANDSHAPE_CACHE_DIR, REVIEW_LOG_PATH, SAMPLE_EXCEPTION_CSV_PATH, VIDEOS_CACHE_DIR
+from ..paths import HANDSHAPE_CACHE_DIR, REPORTS_DIR, REVIEW_LOG_PATH, SAMPLE_EXCEPTION_CSV_PATH, VIDEOS_CACHE_DIR
 from ..pipeline import ValidationResult
 from ..compare import combined_similarity
 from ..pipeline import Extractors
@@ -148,6 +148,7 @@ class MainWindow(QMainWindow):
         self._size_to_screen()
 
         self.entries: list[DatasetEntry] = []
+        self._metadata_path: Optional[Path] = None  # 진단 버튼에서 원본 파일을 다시 읽어볼 때 씀
         # 아래 dict들은 전부 origin_no가 아니라 entry_key(origin_no+video_id)로 키를 잡는다.
         # 같은 글로스(origin_no)를 004/009/011처럼 여러 사람(video_id)이 각자 촬영한
         # 경우가 흔한데, origin_no만 쓰면 그 사람들의 서로 다른 항목이 하나로 뭉개져서
@@ -391,6 +392,11 @@ class MainWindow(QMainWindow):
         btn_report.clicked.connect(self._generate_report)
         row3.addWidget(btn_report)
 
+        btn_exc_diag = QPushButton("🔍 예외 항목 진단")
+        btn_exc_diag.setToolTip("예외처리 기록이 지금 불러온 메타데이터와 왜 안 맞는지 원인을 찾아 보여줍니다.")
+        btn_exc_diag.clicked.connect(self._run_exception_diagnostics)
+        row3.addWidget(btn_exc_diag)
+
         btn_restart = QPushButton("🔄 재시작")
         btn_restart.setToolTip("현재 창을 닫고 프로그램을 새로 시작합니다.")
         btn_restart.clicked.connect(self._restart_app)
@@ -565,6 +571,7 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "오류", f"메타데이터 로드 실패:\n{e}")
             return
+        self._metadata_path = Path(path)
         self._index_entries()
         self.meta_label.setText(f"{Path(path).name} ({len(self.entries)}개 항목)")
         self._refresh_table()
@@ -709,6 +716,7 @@ class MainWindow(QMainWindow):
             if p.exists():
                 try:
                     self.entries = load_dataset(p)
+                    self._metadata_path = p
                     self._index_entries()
                     self.meta_label.setText(f"{p.name} ({len(self.entries)}개 항목, 이전 설정 기억)")
                     self._refresh_table()
@@ -769,6 +777,7 @@ class MainWindow(QMainWindow):
             if meta_candidate is not None:
                 try:
                     self.entries = load_dataset(meta_candidate)
+                    self._metadata_path = meta_candidate
                     self._index_entries()
                     self.meta_label.setText(f"{meta_candidate.name} ({len(self.entries)}개 항목, 자동)")
                     self._refresh_table()
@@ -880,6 +889,110 @@ class MainWindow(QMainWindow):
                     f"[gui]   예: origin_no={origin_no} 예외기록 video_id={video_id!r}(사람={exc_subset!r}) "
                     f"- 메타데이터엔 이 글로스에 이 사람들만 있음: {available}"
                 )
+
+    def _run_exception_diagnostics(self):
+        """예외처리 기록이 지금 불러온 메타데이터와 왜 안 맞는지 터미널 명령 없이
+        버튼 한 번으로 확인할 수 있게 한다. 원본 파일은 읽기만 하고 절대 안 건드림."""
+        if self.exception_store is None:
+            QMessageBox.warning(self, "안내", "먼저 예외처리 원본을 열어주세요.")
+            return
+        if not self.entries:
+            QMessageBox.warning(self, "안내", "먼저 메타데이터를 불러와주세요.")
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            report = self._build_exception_diagnostics_report()
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        out_path = REPORTS_DIR / "exception_diagnostics.txt"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(report, encoding="utf-8")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("예외 항목 진단 결과 (읽기 전용 - 원본 파일 안 건드림)")
+        dlg.resize(900, 650)
+        layout = QVBoxLayout(dlg)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(report)
+        layout.addWidget(text)
+        layout.addWidget(QLabel(f"이 내용은 파일로도 저장됐습니다(읽기 전용, 원본과 무관): {out_path}"))
+        btn_close = QPushButton("닫기")
+        btn_close.clicked.connect(dlg.accept)
+        layout.addWidget(btn_close)
+        dlg.exec_()
+
+    def _build_exception_diagnostics_report(self) -> str:
+        def subset_of(video_id: str) -> str:
+            return video_id.split("/")[0].strip() if video_id else ""
+
+        exc_rows = self.exception_store.all_rows()
+        exc_origin_nos = {r.origin_no for r in exc_rows}
+        loaded_origin_nos = {e.origin_no for e in self.entries}
+        missing_origin = exc_origin_nos - loaded_origin_nos
+
+        entries_by_origin: dict[str, list[DatasetEntry]] = {}
+        for e in self.entries:
+            entries_by_origin.setdefault(e.origin_no, []).append(e)
+
+        matched = [e for e in self.entries if self.exception_store.is_exception(e.origin_no, e.video_id or "")]
+
+        subset_mismatch = []
+        for r in exc_rows:
+            if r.origin_no in missing_origin or not r.video_id or r.video_id.startswith("(video_id 불명"):
+                continue
+            available = sorted({subset_of(c.video_id or "") for c in entries_by_origin.get(r.origin_no, [])})
+            exc_subset = subset_of(r.video_id)
+            if exc_subset not in available:
+                subset_mismatch.append((r.origin_no, r.video_id, exc_subset, available))
+
+        # 지금 불러온 메타데이터 전체에서 사람(subset)별로 몇 개 항목이 있는지 -
+        # "011/012번 사람이 이 메타데이터에 아예 없는 건지, 이 글로스들만 우연히
+        # 없는 건지"를 바로 구분하기 위함(사용자 질문에 대한 직접적인 답).
+        global_subset_counts: dict[str, int] = {}
+        for e in self.entries:
+            s = subset_of(e.video_id or "")
+            global_subset_counts[s] = global_subset_counts.get(s, 0) + 1
+
+        exc_subset_counts: dict[str, int] = {}
+        for r in exc_rows:
+            if r.video_id and not r.video_id.startswith("(video_id 불명"):
+                s = subset_of(r.video_id)
+                exc_subset_counts[s] = exc_subset_counts.get(s, 0) + 1
+
+        lines = []
+        lines.append("=== 예외 항목 진단 결과 (원본 파일은 전혀 건드리지 않습니다) ===")
+        lines.append("")
+        lines.append(f"메타데이터 항목 수: {len(self.entries)}개 (파일: {self._metadata_path or '알 수 없음'})")
+        lines.append(f"예외처리 기록 수: {len(exc_rows)}개 (서로 다른 origin_no {len(exc_origin_nos)}개)")
+        lines.append(f"지금 매칭되는 항목 수: {len(matched)}개")
+        lines.append(f"메타데이터에 origin_no 자체가 없는 예외 기록: {len(missing_origin)}개")
+        lines.append(f"origin_no는 있지만 그 사람(subset) 영상이 없는 예외 기록: {len(subset_mismatch)}개")
+        lines.append("")
+        lines.append("--- 지금 불러온 메타데이터에 사람(subset)별로 몇 항목씩 있는지 (전체 기준) ---")
+        for s, c in sorted(global_subset_counts.items(), key=lambda kv: -kv[1]):
+            lines.append(f"  {s or '(사람 구분 없음)'}: {c}개")
+        lines.append("")
+        lines.append("--- 예외처리 기록에 사람(subset)별로 몇 건씩 있는지 ---")
+        for s, c in sorted(exc_subset_counts.items(), key=lambda kv: -kv[1]):
+            in_metadata = "메타데이터에 이 사람 항목 있음" if global_subset_counts.get(s, 0) > 0 else "★ 메타데이터 전체에 이 사람 항목이 하나도 없음"
+            lines.append(f"  {s or '(사람 구분 없음)'}: {c}건 - {in_metadata}")
+        lines.append("")
+        if missing_origin:
+            lines.append(f"--- 메타데이터에 origin_no 자체가 없는 예외 기록 샘플(최대 20개) ---")
+            for o in sorted(missing_origin)[:20]:
+                lines.append(f"  origin_no={o}")
+            lines.append("")
+        if subset_mismatch:
+            lines.append(f"--- origin_no는 있지만 사람(subset)이 안 맞는 예외 기록 샘플(최대 30개) ---")
+            for origin_no, video_id, exc_subset, available in subset_mismatch[:30]:
+                lines.append(
+                    f"  origin_no={origin_no} 예외기록 video_id={video_id!r}(사람={exc_subset!r}) "
+                    f"- 메타데이터엔 이 글로스에 이 사람들만 있음: {available}"
+                )
+        return "\n".join(lines)
 
     def _refresh_table(self):
         self.table.setSortingEnabled(False)
