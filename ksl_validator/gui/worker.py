@@ -12,6 +12,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from .. import sldict_client
 from ..keyframe_images import (
     build_keyframe_images_index,
+    find_exception_video_path,
     load_gloss_reference_images,
     load_instance_keyframes,
     resolve_instance_video_path,
@@ -181,3 +182,48 @@ class KeyframeIndexThread(QThread):
         t0 = time.perf_counter()
         index = build_keyframe_images_index(self.keyframe_images_dir)
         self.finished_index.emit(len(index), time.perf_counter() - t0)
+
+
+class MissingVideoRecoveryThread(QThread):
+    """metadata.csv에 행이 없어서 안 보이던 예외 항목을, 예외처리 기록에 이미
+    적혀있는 실제 video_id로 NAS에서 영상 파일을 직접 찾아 검토 목록에 복구한다.
+
+    원본 태깅 도구를 확인해보니 영상을 예외처리하면 EXCEPTION/{subset}/... 폴더로
+    옮겨져서 metadata.csv를 다시 만들어도 거기 없는 게 정상 동작이었다(버그가
+    아니었음). 후보 개수가 수백~수천 개일 수 있어 NAS 파일 존재 확인을 전부
+    백그라운드에서 한다."""
+
+    progress = pyqtSignal(int, int)          # done, total
+    found = pyqtSignal(object)               # DatasetEntry (찾은 것마다 하나씩)
+    finished_scan = pyqtSignal(int, int)     # 찾은 개수, 전체 후보 개수
+
+    def __init__(self, dataset_root: Path, candidates: list[tuple[str, str, str]], parent=None):
+        # candidates: [(origin_no, gloss_name, video_id), ...]
+        super().__init__(parent)
+        self.dataset_root = dataset_root
+        self.candidates = candidates
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        total = len(self.candidates)
+        n_found = 0
+        for i, (origin_no, gloss_name, video_id) in enumerate(self.candidates):
+            if self._stop_requested:
+                break
+            video_path = find_exception_video_path(self.dataset_root, video_id)
+            if video_path is not None:
+                rel_path = video_path.relative_to(self.dataset_root)
+                entry = DatasetEntry(
+                    origin_no=origin_no,
+                    gloss_name=gloss_name,
+                    keyframes=[],
+                    video_rel_path=str(rel_path),
+                    video_id=video_id,
+                )
+                n_found += 1
+                self.found.emit(entry)
+            self.progress.emit(i + 1, total)
+        self.finished_scan.emit(n_found, total)

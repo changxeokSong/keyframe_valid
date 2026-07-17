@@ -217,3 +217,38 @@ def load_instance_keyframes(entry, dataset_root: Optional[Path] = None,
             if frames:
                 return frames
     return []
+
+
+def find_exception_video_path(dataset_root: Path, video_id: str) -> Optional[Path]:
+    """metadata.csv에 그 예외처리된 영상의 행이 없어도, video_id로 실제 파일을
+    NAS에서 직접 찾는다.
+
+    원본 태깅 도구(online-sign-keyframe-detection-transformers/tools/tagging)의
+    코드를 확인한 결과, 영상을 예외처리하면 원래 위치({subset}/MP4/...)가 아니라
+    별도의 EXCEPTION/{subset}/{MP4,MKV,VIDEO}/{stem}{확장자} 폴더로 옮겨진다
+    (실제로 NAS에도 EXCEPTION 폴더가 있는 것으로 확인됨). 그래서 metadata.csv를
+    아무리 다시 만들어도 이미 예외처리된 영상은 거기 없는 게 정상이다 - 이건
+    metadata.csv가 못 따라간 게 아니라 원래 그렇게 동작하는 것.
+
+    video_id의 "/" 앞부분이 subset, 마지막 부분이 실제 파일명(stem, 확장자 제외)
+    이다(원본 도구도 항상 이렇게 파싱함 - 중간에 세그먼트가 더 있어도 무시).
+    EXCEPTION 폴더를 먼저 찾고, 혹시 옮겨지기 전이면 원래 위치도 확인한다."""
+    if "/" not in video_id:
+        return None
+    subset = video_id.split("/")[0].strip()
+    stem = video_id.rsplit("/", 1)[-1].strip()
+    if not subset or not stem:
+        return None
+
+    exts = (".mp4", ".mkv", ".avi", ".mov")
+    for base in (dataset_root / "EXCEPTION" / subset, dataset_root / subset):
+        for subdir in ("MP4", "MKV", "VIDEO"):
+            for ext in exts:
+                candidate = base / subdir / f"{stem}{ext}"
+                if candidate.exists():
+                    return candidate
+        for ext in exts:
+            candidate = base / f"{stem}{ext}"
+            if candidate.exists():
+                return candidate
+    return None

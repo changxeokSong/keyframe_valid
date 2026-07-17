@@ -39,7 +39,13 @@ from ..compare import combined_similarity
 from ..pipeline import Extractors
 from ..report import build_report, DEFAULT_REPORT_MD_PATH
 from ..user_info import safe_getuser
-from .worker import HandshapeFetchThread, KeyframeIndexThread, KeyframeLoadThread, ValidationWorker
+from .worker import (
+    HandshapeFetchThread,
+    KeyframeIndexThread,
+    KeyframeLoadThread,
+    MissingVideoRecoveryThread,
+    ValidationWorker,
+)
 
 IMG_W, IMG_H = 220, 165
 
@@ -182,6 +188,8 @@ class MainWindow(QMainWindow):
         self._kf_thread: Optional[KeyframeLoadThread] = None
         self._kf_thread_origin: Optional[str] = None  # 지금 돌고 있는 KeyframeLoadThread가 어느 entry_key용인지
         self._kf_index_thread: Optional[KeyframeIndexThread] = None
+        self._recovery_thread: Optional[MissingVideoRecoveryThread] = None
+        self._recovered_buffer: list[DatasetEntry] = []
         self._extractors: Optional[Extractors] = None  # 지연 로딩 (첫 비교 때 한 번만 모델 로드)
         self._validating_origin_no: Optional[str] = None
         self._play_timer = QTimer(self)
@@ -396,6 +404,14 @@ class MainWindow(QMainWindow):
         btn_exc_diag.setToolTip("예외처리 기록이 지금 불러온 메타데이터와 왜 안 맞는지 원인을 찾아 보여줍니다.")
         btn_exc_diag.clicked.connect(self._run_exception_diagnostics)
         row3.addWidget(btn_exc_diag)
+
+        btn_recover = QPushButton("🔎 누락된 예외 영상 찾기")
+        btn_recover.setToolTip(
+            "metadata.csv에 행이 없어서 안 보이던 예외처리 영상을, NAS 폴더 이름 "
+            "규칙으로 직접 찾아서 검토 목록에 추가합니다 (원본 파일은 읽기만 함)."
+        )
+        btn_recover.clicked.connect(self._recover_missing_exception_videos)
+        row3.addWidget(btn_recover)
 
         btn_restart = QPushButton("🔄 재시작")
         btn_restart.setToolTip("현재 창을 닫고 프로그램을 새로 시작합니다.")
@@ -993,6 +1009,92 @@ class MainWindow(QMainWindow):
                     f"- 메타데이터엔 이 글로스에 이 사람들만 있음: {available}"
                 )
         return "\n".join(lines)
+
+    def _recover_missing_exception_videos(self):
+        """예외처리는 됐는데 metadata.csv에 그 사람(subset)의 행이 없어서 검토
+        목록에 아예 안 뜨던 항목을, 예외처리 기록에 이미 적혀있는 실제 video_id로
+        NAS에서 영상 파일을 직접 찾아 검토 목록에 추가한다. (원본 태깅 도구 코드
+        확인 결과: 예외처리된 영상은 EXCEPTION/ 폴더로 옮겨져서 metadata.csv를
+        다시 만들어도 원래 없는 게 정상 - 버그가 아니라 그런 설계였음.)
+        원본 파일은 존재 여부만 확인하고 절대 쓰지 않는다."""
+        if self.exception_store is None:
+            QMessageBox.warning(self, "안내", "먼저 예외처리 원본을 열어주세요.")
+            return
+        if not self.entries:
+            QMessageBox.warning(self, "안내", "먼저 메타데이터를 불러와주세요.")
+            return
+        if self.dataset_root is None:
+            QMessageBox.warning(self, "안내", "먼저 NAS 데이터셋 루트를 지정해주세요 (영상 파일을 찾으려면 필요합니다).")
+            return
+        if self._recovery_thread is not None and self._recovery_thread.isRunning():
+            QMessageBox.information(self, "안내", "이미 찾는 중입니다. 끝날 때까지 기다려주세요.")
+            return
+
+        def subset_of(video_id: str) -> str:
+            return video_id.split("/")[0].strip() if video_id else ""
+
+        entries_by_origin: dict[str, list[DatasetEntry]] = {}
+        for e in self.entries:
+            entries_by_origin.setdefault(e.origin_no, []).append(e)
+
+        seen_candidates: set[tuple] = set()
+        candidates: list[tuple[str, str, str]] = []
+        for r in self.exception_store.all_rows():
+            if not r.video_id or r.video_id.startswith("(video_id 불명"):
+                continue
+            subset = subset_of(r.video_id)
+            if not subset:
+                continue
+            available = {subset_of(c.video_id or "") for c in entries_by_origin.get(r.origin_no, [])}
+            if subset in available:
+                continue  # 메타데이터에 이미 이 사람 것이 있음 - 찾을 필요 없음
+            cand_key = (r.origin_no, subset)
+            if cand_key in seen_candidates:
+                continue
+            seen_candidates.add(cand_key)
+            candidates.append((r.origin_no, r.gloss_name, r.video_id))
+
+        if not candidates:
+            QMessageBox.information(self, "안내", "찾아야 할 누락 항목이 없습니다 (전부 이미 목록에 있거나 예외 기록이 없습니다).")
+            return
+
+        reply = QMessageBox.question(
+            self, "누락 영상 찾기",
+            f"{len(candidates)}개 후보에 대해 NAS에서 영상 파일이 실제 있는지 확인합니다 "
+            f"(개수에 따라 시간이 걸릴 수 있습니다). 원본은 존재 여부만 확인하고 "
+            f"절대 수정하지 않습니다. 계속할까요?",
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._recovered_buffer = []
+        self._recovery_thread = MissingVideoRecoveryThread(self.dataset_root, candidates)
+        self._recovery_thread.found.connect(self._recovered_buffer.append)
+        self._recovery_thread.progress.connect(self._on_recovery_progress)
+        self._recovery_thread.finished_scan.connect(self._on_recovery_finished)
+        self.progress_bar.setFormat("누락 영상 NAS에서 찾는 중... %v/%m")
+        self.progress_bar.setRange(0, len(candidates))
+        self.progress_bar.setValue(0)
+        self._recovery_thread.start()
+
+    def _on_recovery_progress(self, done: int, total: int):
+        self.progress_bar.setValue(done)
+
+    def _on_recovery_finished(self, n_found: int, n_total: int):
+        self.progress_bar.setFormat("대기 중")
+        self.progress_bar.setValue(0)
+        recovered = self._recovered_buffer
+        self._recovered_buffer = []
+        if recovered:
+            self.entries.extend(recovered)
+            self._index_entries()
+            self._refresh_table()
+        QMessageBox.information(
+            self, "누락 영상 찾기 완료",
+            f"{n_total}개 후보 중 {n_found}개 영상을 NAS에서 찾아 검토 목록에 추가했습니다.\n\n"
+            f"metadata.csv에 없던 항목이라 태깅된 키프레임 정보는 없습니다 - "
+            f"'키프레임 이미지 직접 지정' 또는 영상 재생으로 직접 검토해주세요.",
+        )
 
     def _refresh_table(self):
         self.table.setSortingEnabled(False)
